@@ -1,26 +1,58 @@
-.. image:: https://media.charlesleifer.com/blog/photos/peewee3-logo.png
+.. image:: https://media.charlesleifer.com/blog/photos/peewee4-logo.png
 
 peewee
 ======
 
-Peewee is a simple and small ORM. It has few (but expressive) concepts, making it easy to learn and intuitive to use.
+Peewee is a simple and small ORM. It has few (but expressive) concepts, making
+it easy to learn and intuitive to use.
+
+Peewee is a single module with no required dependencies and has been running
+production workloads of all sizes since 2010.
 
 * a small, expressive ORM
-* python 2.7+ and 3.4+ (developed with 3.6)
-* supports sqlite, mysql, postgresql and cockroachdb
-* tons of `extensions <http://docs.peewee-orm.com/en/latest/peewee/playhouse.html>`_
-
-.. image:: https://travis-ci.org/coleifer/peewee.svg?branch=master
-  :target: https://travis-ci.org/coleifer/peewee
+* flexible query-builder that exposes full power of SQL
+* supports sqlite, mysql, mariadb, postgresql
+* `asyncio support <https://docs.peewee-orm.com/en/latest/peewee/asyncio.html>`__
+  built on the standard async drivers (aiosqlite, asyncpg, aiomysql)
+* `schema migrations <https://docs.peewee-orm.com/en/latest/peewee/db_tools.html#migration-runner>`__
+  with diff-based generation (``pwmigrate``)
+* tons of extensions
+* use with `flask <https://docs.peewee-orm.com/en/latest/peewee/framework_integration.html#flask>`__,
+  `fastapi <https://docs.peewee-orm.com/en/latest/peewee/framework_integration.html#fastapi>`__,
+  `pydantic <https://docs.peewee-orm.com/en/latest/peewee/orm_utils.html#module-playhouse.pydantic_utils>`__, and
+  `more <https://docs.peewee-orm.com/en/latest/peewee/framework_integration.html>`__.
 
 New to peewee? These may help:
 
-* `Quickstart <http://docs.peewee-orm.com/en/latest/peewee/quickstart.html#quickstart>`_
-* `Example twitter app <http://docs.peewee-orm.com/en/latest/peewee/example.html>`_
-* `Using peewee interactively <http://docs.peewee-orm.com/en/latest/peewee/interactive.html>`_
+* `Quickstart <https://docs.peewee-orm.com/en/latest/peewee/quickstart.html#quickstart>`_
+* `Example twitter app <https://docs.peewee-orm.com/en/latest/peewee/example.html#example>`_
+* `Using peewee interactively <https://docs.peewee-orm.com/en/latest/peewee/interactive.html#interactive>`_
 * `Models and fields <http://docs.peewee-orm.com/en/latest/peewee/models.html>`_
 * `Querying <http://docs.peewee-orm.com/en/latest/peewee/querying.html>`_
 * `Relationships and joins <http://docs.peewee-orm.com/en/latest/peewee/relationships.html>`_
+* `Extensive library of SQL / Peewee examples <https://docs.peewee-orm.com/en/latest/peewee/query_library.html#query-library>`_
+* `Flask setup <https://docs.peewee-orm.com/en/latest/peewee/framework_integration.html#flask>`_
+  or `FastAPI setup <https://docs.peewee-orm.com/en/latest/peewee/framework_integration.html#fastapi>`_
+
+Installation:
+
+.. code-block:: console
+
+    pip install peewee
+
+Sqlite comes built-in provided by the standard-lib ``sqlite3`` module. Other
+backends can be installed using the following instead:
+
+.. code-block:: console
+
+    pip install peewee[mysql]  # Install peewee with pymysql.
+    pip install peewee[postgres]  # Install peewee with psycopg2.
+    pip install peewee[psycopg3]  # Install peewee with psycopg3.
+
+    # AsyncIO implementations.
+    pip install peewee[aiosqlite]  # Install peewee with aiosqlite.
+    pip install peewee[aiomysql]  # Install peewee with aiomysql.
+    pip install peewee[asyncpg]  # Install peewee with asyncpg.
 
 Examples
 --------
@@ -104,10 +136,62 @@ Queries are expressive and composable:
              .group_by(User)
              .order_by(tweet_ct.desc()))
 
-    # Do an atomic update
-    Counter.update(count=Counter.count + 1).where(Counter.url == request.url)
+    # Do an atomic update (for illustrative purposes only, imagine a simple
+    # table for tracking a "count" associated with each URL). We don't want to
+    # naively get the save in two separate steps since this is prone to race
+    # conditions.
+    Counter.update(count=Counter.count + 1).where(Counter.url == request.url).execute()
 
 Check out the `example twitter app <http://docs.peewee-orm.com/en/latest/peewee/example.html>`_.
+
+Asyncio
+-------
+
+.. code-block:: python
+
+    import asyncio
+    from peewee import *
+    from playhouse.pwasyncio import AsyncPostgresqlDatabase
+
+    db = AsyncPostgresqlDatabase('my_app')
+
+    class User(db.Model):
+        username = CharField(unique=True)
+
+    class Tweet(db.Model):
+        user = ForeignKeyField(User, backref='tweets')
+        message = TextField()
+
+    async def main():
+        async with db:
+            await db.acreate_tables([User, Tweet])
+
+            # Queries are awaited on the event loop using asyncpg.
+            huey = await User.acreate(username='huey')
+            tweet = await Tweet.acreate(user=huey, message='meow')
+
+            async with db.atomic():
+                tweet.message = 'purr'
+                await tweet.asave()
+
+            # Create a query - nothing is executed yet.
+            query = Tweet.select(Tweet, User).join(User)
+
+            # Execute and buffer the results.
+            tweets = await query.aexecute()  # Or: await db.list(query)
+            for tweet in tweets:
+                print(tweet.user.username, '->', tweet.message)
+
+            # Streaming results via server-side cursor.
+            async for tweet in db.iterate(query):
+                print(tweet.user.username, '->', tweet.message)
+
+        await db.close_pool()
+
+    asyncio.run(main())
+
+See the `asyncio docs <https://docs.peewee-orm.com/en/latest/peewee/asyncio.html>`_
+for details.
 
 Learning more
 -------------
@@ -132,4 +216,3 @@ I've written a number of blog posts about building applications and web-services
 * `Building a pastebin, wiki and a bookmarking service using Flask and Peewee <https://charlesleifer.com/blog/dont-sweat-small-stuff-use-flask-blueprints/>`_.
 * `Encrypted databases with Python and SQLCipher <https://charlesleifer.com/blog/encrypted-sqlite-databases-with-python-and-sqlcipher/>`_.
 * `Dear Diary: An Encrypted, Command-Line Diary with Peewee <https://charlesleifer.com/blog/dear-diary-an-encrypted-command-line-diary-with-python/>`_.
-* `Query Tree Structures in SQLite using Peewee and the Transitive Closure Extension <https://charlesleifer.com/blog/querying-tree-structures-in-sqlite-using-python-and-the-transitive-closure-extension/>`_.

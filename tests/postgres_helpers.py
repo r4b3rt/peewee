@@ -98,12 +98,16 @@ class BaseJsonFieldTestCase(object):
             self.assertEqual(query.get(), expected)
 
         expr = self.M.data.path('foo', 'baz', 'bar')
-        assertPath(expr.alias('p1'), {'p1': '["i1", "i2", "i3"]'})
-        assertPath(expr.as_json().alias('p2'), {'p2': ['i1', 'i2', 'i3']})
+        assertPath(expr.alias('p1'), {'p1': ['i1', 'i2', 'i3']})
+        assertPath(expr.alias('p2'), {'p2': ['i1', 'i2', 'i3']})
 
         expr = self.M.data.path('foo', 'baz', 'baze', 1)
         assertPath(expr.alias('p1'), {'p1': 'j2'})
-        assertPath(expr.as_json().alias('p2'), {'p2': 'j2'})
+        assertPath(expr.alias('p2'), {'p2': 'j2'})
+
+        expr = self.M.data['foo'].path('baz', 'bar')
+        assertPath(expr.as_json(False).alias('p1'), {'p1': '["i1", "i2", "i3"]'})
+        assertPath(expr.alias('p2'), {'p2': ['i1', 'i2', 'i3']})
 
     def test_json_field_sql(self):
         j = (self.M
@@ -112,15 +116,15 @@ class BaseJsonFieldTestCase(object):
         table = self.M._meta.table_name
         self.assertSQL(j, (
             'SELECT "t1"."id", "t1"."data" '
-            'FROM "%s" AS "t1" WHERE ("t1"."data" = CAST(? AS %s))')
-            % (table, self.M.data._json_datatype))
+            'FROM "%s" AS "t1" WHERE ("t1"."data" = ?)')
+            % table)
 
         j = (self.M
              .select()
              .where(self.M.data['foo'] == 'bar'))
         self.assertSQL(j, (
             'SELECT "t1"."id", "t1"."data" '
-            'FROM "%s" AS "t1" WHERE ("t1"."data"->>? = ?)') % table)
+            'FROM "%s" AS "t1" WHERE ("t1"."data"->>\'foo\' = ?)') % table)
 
     def assertItems(self, where, *items):
         query = (self.M
@@ -149,16 +153,32 @@ class BaseJsonFieldTestCase(object):
 
         self.assertItems((self.M.data['k2']['xxx'] == 'v1'))
 
+    def test_bulk_update(self):
+        m1 = self.M.create(data={'k1': 'v1'})
+        m2 = self.M.create(data={'k2': 'v2'})
+        m3 = self.M.create(data=['i1', 'i2'])
+        m1.data['k1'] = 'v1-x'
+        m2.data['k2'] = 'v2-y'
+        m3.data.append('i3')
+        self.M.bulk_update([m1, m2, m3], fields=[self.M.data])
+
+        m1_db = self.M.get(self.M.id == m1.id)
+        m2_db = self.M.get(self.M.id == m2.id)
+        m3_db = self.M.get(self.M.id == m3.id)
+        self.assertEqual(m1_db.data, {'k1': 'v1-x'})
+        self.assertEqual(m2_db.data, {'k2': 'v2-y'})
+        self.assertEqual(m3_db.data, ['i1', 'i2', 'i3'])
+
     def test_json_bulk_update_top_level_list(self):
         m1 = self.M.create(data=['a', 'b', 'c'])
         m2 = self.M.create(data=['d', 'e', 'f'])
 
-        m1.data = ['g', 'h', 'i']
+        m1.data = ['g', 'h', 'i', {'j': 'kk'}]
         m2.data = ['j', 'k', 'l']
         self.M.bulk_update([m1, m2], fields=[self.M.data])
         m1_db = self.M.get(self.M.id == m1.id)
         m2_db = self.M.get(self.M.id == m2.id)
-        self.assertEqual(m1_db.data, ['g', 'h', 'i'])
+        self.assertEqual(m1_db.data, ['g', 'h', 'i', {'j': 'kk'}])
         self.assertEqual(m2_db.data, ['j', 'k', 'l'])
 
 
@@ -188,12 +208,24 @@ class BaseBinaryJsonFieldTestCase(BaseJsonFieldTestCase):
 
     def test_contained_by(self):
         self._create_test_data()
+        D = self.M.data
 
         item1 = ['a1', 'a2', {'a3': 'a4'}, 'a5']
-        self.assertObjects(self.M.data.contained_by(item1), 1)
+        self.assertObjects(D.contained_by(item1), 1)
 
         item2 = {'a1': 'x1', 'a2': 'x2', 'k4': ['i0', 'i1', 'i2'], 'x': 'y'}
-        self.assertObjects(self.M.data.contained_by(item2), 2)
+        self.assertObjects(D.contained_by(item2), 2)
+
+        self.assertObjects(D.contained_by(list(range(10))), 3)
+        self.assertObjects(D.contained_by(list(range(20))), 3, 4)
+
+    def test_contained_by_nested(self):
+        self._create_test_data()
+        D = self.M.data
+        self.assertObjects(D['k4'].contained_by(['i1', 'i2']), 2)
+        self.assertObjects(D['k3']['k4'].contained_by(['i1', 'i2']), 0)
+        self.assertObjects(D[2].contained_by({'a3': 'a4'}), 1)
+        self.assertObjects(D[0].contained_by(['a1', 'ax']), 1)
 
     def test_equality(self):
         data = {'k1': ['a1', 'a2'], 'k2': {'k3': 'v3'}}
@@ -207,7 +239,7 @@ class BaseBinaryJsonFieldTestCase(BaseJsonFieldTestCase):
 
         # 'k3' is mapped to another dictioary {'k4': [...]}. Therefore,
         # 'k3' is said to contain 'k4', but *not* ['k4'] or ['k4', 'k5'].
-        self.assertObjects(D['k3'].contains('k4'), 0)
+        self.assertObjects(D['k3'].has_key('k4'), 0)
         self.assertObjects(D['k3'].contains(['k4']))
         self.assertObjects(D['k3'].contains(['k4', 'k5']))
 
@@ -235,7 +267,8 @@ class BaseBinaryJsonFieldTestCase(BaseJsonFieldTestCase):
         self.assertObjects(D['k4'].contains_all('i1', 'i2'), 2)
 
         # Check array indexes.
-        self.assertObjects(D[2].contains('a3'), 1)
+        self.assertObjects(D[2].has_key('a3'), 1)
+        self.assertObjects(D[2].contains('a3'))
         self.assertObjects(D[0].contains('a1'), 1)
         self.assertObjects(D[0].contains('k1'))
 
@@ -244,9 +277,10 @@ class BaseBinaryJsonFieldTestCase(BaseJsonFieldTestCase):
         D = self.M.data
 
         # Test for keys. 'k4' is both an object key and an array element.
-        self.assertObjects(D.contains('k4'), 2, 5)
-        self.assertObjects(D.contains('a1'), 1, 2)
-        self.assertObjects(D.contains('k3'), 0)
+        self.assertObjects(D.has_key('k4'), 2, 5)
+        self.assertObjects(D.has_key('a1'), 1, 2)
+        self.assertObjects(D.contains('a1'), 1)
+        self.assertObjects(D.has_key('k3'), 0)
 
         # We can test for multiple top-level keys/indexes.
         self.assertObjects(D.contains_all('a1', 'a2'), 1, 2)
@@ -265,8 +299,9 @@ class BaseBinaryJsonFieldTestCase(BaseJsonFieldTestCase):
         self.assertObjects(D.contains([{'a3': 'a4'}]), 1)
 
         # Check for simple keys.
-        self.assertObjects(D.contains('a1'), 1, 2)
-        self.assertObjects(D.contains('k3'), 0)
+        self.assertObjects(D.contains(['a1']), 1)
+        self.assertObjects(D.contains('a1'), 1)
+        self.assertObjects(D.contains('k3'))
 
         # Contains any.
         self.assertObjects(D.contains_any('a1', 'k1'), 0, 1, 2, 5)
@@ -285,6 +320,27 @@ class BaseBinaryJsonFieldTestCase(BaseJsonFieldTestCase):
 
         self.assertObjects(D['k3'].has_key('k4'), 0)
         self.assertObjects(D['k4'].has_key('i2'), 2)
+
+    def test_contains_contained_by(self):
+        samples = (
+            {'k1': 'v1', 'k2': 'v2'},
+            {'k1': 'v10'},
+            ['i1', 'i2', 'i3', 'test'],
+            'k1',
+            123,
+            1.5,
+            True,
+            False)
+        pks = []
+        for sample in samples:
+            pks.append(self.M.create(data=sample).id)
+
+        for i, sample in enumerate(samples):
+            q = self.M.select().where(self.M.data.contains(sample))
+            self.assertEqual([x.id for x in q], [pks[i]])
+
+            q = self.M.select().where(self.M.data.contained_by(sample))
+            self.assertEqual([x.id for x in q], [pks[i]])
 
     def test_concat_data(self):
         self.M.delete().execute()
@@ -364,7 +420,7 @@ class BaseBinaryJsonFieldTestCase(BaseJsonFieldTestCase):
         self.assertEqual(b1.id, b1_id_db)
 
         b1_db = self.M.get(self.M.id == b1.id)
-        self.assertEqual(self.M.data, {'k1': 'v1-z'})
+        self.assertEqual(b1_db.data, {'k1': 'v1-z'})
 
         iq = (self.M
               .insert(id=b1.id, data={'k1': 'v1-y'})
@@ -374,6 +430,6 @@ class BaseBinaryJsonFieldTestCase(BaseJsonFieldTestCase):
         self.assertEqual(b1.id, b1_id_db)
 
         b1_db = self.M.get(self.M.id == b1.id)
-        self.assertEqual(self.M.data, {'k1': 'v1-w'})
+        self.assertEqual(b1_db.data, {'k1': 'v1-w'})
 
         self.assertEqual(self.M.select().count(), 1)

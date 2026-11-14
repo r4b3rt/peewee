@@ -1,15 +1,21 @@
+"""
+ManyToManyField behavior tests: through models (auto and explicit), backrefs,
+inheritance, FK-to-non-PK, FK-as-PK, and multiple M2M on same tables.
+"""
 from peewee import *
 
 from .base import ModelTestCase
 from .base import TestModel
-from .base import get_in_memory_db
-from .base import requires_models
-from .base_models import Tweet
-from .base_models import User
 
 
+# ---------------------------------------------------------------------------
+# Module-local models for M2M tests.
+# ---------------------------------------------------------------------------
+
+# M2M binding installs accessors on the rel model at import, so these cannot
+# be the shared base_models.
 class User(TestModel):
-    username = TextField(unique=True)
+    username = CharField(unique=True)  # CharField: mysql cannot index TEXT.
 
 class Note(TestModel):
     text = TextField()
@@ -32,182 +38,13 @@ class AltThroughModel(TestModel):
 
 AltThroughDeferred.set_model(AltThroughModel)
 
-class Student(TestModel):
-    name = TextField()
-
-CourseStudentDeferred = DeferredThroughModel()
-
-class Course(TestModel):
-    name = TextField()
-    students = ManyToManyField(Student, backref='+')
-    students2 = ManyToManyField(Student, through_model=CourseStudentDeferred)
-
-CourseStudent = Course.students.get_through_model()
-
-class CourseStudent2(TestModel):
-    course = ForeignKeyField(Course, backref='+')
-    student = ForeignKeyField(Student, backref='+')
-
-CourseStudentDeferred.set_model(CourseStudent2)
 
 
-class Color(TestModel):
-    name = TextField(unique=True)
-
-LogoColorDeferred = DeferredThroughModel()
-
-class Logo(TestModel):
-    name = TextField(unique=True)
-    colors = ManyToManyField(Color, through_model=LogoColorDeferred)
-
-class LogoColor(TestModel):
-    logo = ForeignKeyField(Logo, field=Logo.name)
-    color = ForeignKeyField(Color, field=Color.name)  # FK to non-PK column.
-
-LogoColorDeferred.set_model(LogoColor)
-
-
-class TestManyToManyFKtoNonPK(ModelTestCase):
-    database = get_in_memory_db()
-    requires = [Color, Logo, LogoColor]
-
-    def test_manytomany_fk_to_non_pk(self):
-        red = Color.create(name='red')
-        green = Color.create(name='green')
-        blue = Color.create(name='blue')
-        lrg = Logo.create(name='logo-rg')
-        lrb = Logo.create(name='logo-rb')
-        lrgb = Logo.create(name='logo-rgb')
-        lrg.colors.add([red, green])
-        lrb.colors.add([red, blue])
-        lrgb.colors.add([red, green, blue])
-
-        def assertColors(logo, expected):
-            colors = [c.name for c in logo.colors.order_by(Color.name)]
-            self.assertEqual(colors, expected)
-
-        assertColors(lrg, ['green', 'red'])
-        assertColors(lrb, ['blue', 'red'])
-        assertColors(lrgb, ['blue', 'green', 'red'])
-
-        def assertLogos(color, expected):
-            logos = [l.name for l in color.logos.order_by(Logo.name)]
-            self.assertEqual(logos, expected)
-
-        assertLogos(red, ['logo-rb', 'logo-rg', 'logo-rgb'])
-        assertLogos(green, ['logo-rg', 'logo-rgb'])
-        assertLogos(blue, ['logo-rb', 'logo-rgb'])
-
-        # Verify we can delete data as well.
-        lrg.colors.remove(red)
-        self.assertEqual([c.name for c in lrg.colors], ['green'])
-
-        blue.logos.remove(lrb)
-        self.assertEqual([c.name for c in lrb.colors], ['red'])
-
-        # Verify we can insert using a SELECT query.
-        lrg.colors.add(Color.select().where(Color.name != 'blue'), True)
-        assertColors(lrg, ['green', 'red'])
-
-        lrb.colors.add(Color.select().where(Color.name == 'blue'))
-        assertColors(lrb, ['blue', 'red'])
-
-        # Verify we can insert logos using a SELECT query.
-        black = Color.create(name='black')
-        black.logos.add(Logo.select().where(Logo.name != 'logo-rgb'))
-        assertLogos(black, ['logo-rb', 'logo-rg'])
-        assertColors(lrb, ['black', 'blue', 'red'])
-        assertColors(lrg, ['black', 'green', 'red'])
-        assertColors(lrgb, ['blue', 'green', 'red'])
-
-        # Verify we can delete using a SELECT query.
-        lrg.colors.remove(Color.select().where(Color.name == 'red'))
-        assertColors(lrg, ['black', 'green'])
-
-        black.logos.remove(Logo.select().where(Logo.name == 'logo-rg'))
-        assertLogos(black, ['logo-rb'])
-
-        # Verify we can clear.
-        lrg.colors.clear()
-        assertColors(lrg, [])
-        assertColors(lrb, ['black', 'blue', 'red'])  # Not affected.
-
-        black.logos.clear()
-        assertLogos(black, [])
-        assertLogos(red, ['logo-rb', 'logo-rgb'])
-
-
-class TestManyToManyBackrefBehavior(ModelTestCase):
-    database = get_in_memory_db()
-    requires = [Student, Course, CourseStudent, CourseStudent2]
-
-    def setUp(self):
-        super(TestManyToManyBackrefBehavior, self).setUp()
-        math = Course.create(name='math')
-        engl = Course.create(name='engl')
-        huey, mickey, zaizee = [Student.create(name=name)
-                                for name in ('huey', 'mickey', 'zaizee')]
-        # Set up relationships.
-        math.students.add([huey, zaizee])
-        engl.students.add([mickey])
-        math.students2.add([mickey])
-        engl.students2.add([huey, zaizee])
-
-    def test_manytomanyfield_disabled_backref(self):
-        math = Course.get(name='math')
-        query = math.students.order_by(Student.name)
-        self.assertEqual([s.name for s in query], ['huey', 'zaizee'])
-
-        huey = Student.get(name='huey')
-        math.students.remove(huey)
-        self.assertEqual([s.name for s in math.students], ['zaizee'])
-
-        # The backref is via the CourseStudent2 through-model.
-        self.assertEqual([c.name for c in huey.courses], ['engl'])
-
-    def test_through_model_disabled_backrefs(self):
-        # Here we're testing the case where the many-to-many field does not
-        # explicitly disable back-references, but the foreign-keys on the
-        # through model have disabled back-references.
-        engl = Course.get(name='engl')
-        query = engl.students2.order_by(Student.name)
-        self.assertEqual([s.name for s in query], ['huey', 'zaizee'])
-
-        zaizee = Student.get(Student.name == 'zaizee')
-        engl.students2.remove(zaizee)
-        self.assertEqual([s.name for s in engl.students2], ['huey'])
-
-        math = Course.get(name='math')
-        self.assertEqual([s.name for s in math.students2], ['mickey'])
-
-
-class TestManyToManyInheritance(ModelTestCase):
-    def test_manytomany_inheritance(self):
-        class BaseModel(TestModel):
-            class Meta:
-                database = self.database
-        class User(BaseModel):
-            username = TextField()
-        class Project(BaseModel):
-            name = TextField()
-            users = ManyToManyField(User, backref='projects')
-
-        def subclass_project():
-            class VProject(Project):
-                pass
-
-        # We cannot subclass Project, because the many-to-many field "users"
-        # will be inherited, but the through-model does not contain a
-        # foreign-key to VProject. The through-model in this case is
-        # ProjectUsers, which has foreign-keys to project and user.
-        self.assertRaises(ValueError, subclass_project)
-        PThrough = Project.users.through_model
-        self.assertTrue(PThrough.project.rel_model is Project)
-        self.assertTrue(PThrough.user.rel_model is User)
-
+# ===========================================================================
+# Core M2M operations (add, remove, set, clear, prefetch)
+# ===========================================================================
 
 class TestManyToMany(ModelTestCase):
-    database = get_in_memory_db()
     requires = [User, Note, NoteUserThrough, AltNote, AltThroughModel]
 
     user_to_note = {
@@ -277,33 +114,37 @@ class TestManyToMany(ModelTestCase):
 
     def test_prefetch_notes(self):
         self._set_data()
-        with self.assertQueryCount(3):
-            gargie, huey, mickey, zaizee = prefetch(
-                User.select().order_by(User.username),
-                NoteUserThrough,
-                Note)
+        for pt in (PREFETCH_TYPE.WHERE, PREFETCH_TYPE.JOIN):
+            with self.assertQueryCount(3):
+                gargie, huey, mickey, zaizee = prefetch(
+                    User.select().order_by(User.username),
+                    NoteUserThrough,
+                    Note,
+                    prefetch_type=pt)
 
-        with self.assertQueryCount(0):
-            self.assertNotes(gargie.notes, [1, 2])
-        with self.assertQueryCount(0):
-            self.assertNotes(zaizee.notes, [4, 5])
+            with self.assertQueryCount(0):
+                self.assertNotes(gargie.notes, [1, 2])
+            with self.assertQueryCount(0):
+                self.assertNotes(zaizee.notes, [4, 5])
         with self.assertQueryCount(2):
             self.assertNotes(User.create(username='x').notes, [])
 
     def test_prefetch_users(self):
         self._set_data()
-        with self.assertQueryCount(3):
-            n1, n2, n3, n4, n5 = prefetch(
-                Note.select().order_by(Note.text),
-                NoteUserThrough,
-                User)
+        for pt in (PREFETCH_TYPE.WHERE, PREFETCH_TYPE.JOIN):
+            with self.assertQueryCount(3):
+                n1, n2, n3, n4, n5 = prefetch(
+                    Note.select().order_by(Note.text),
+                    NoteUserThrough,
+                    User,
+                    prefetch_type=pt)
 
-        with self.assertQueryCount(0):
-            self.assertUsers(n1.users, ['gargie'])
-        with self.assertQueryCount(0):
-            self.assertUsers(n2.users, ['gargie', 'huey'])
-        with self.assertQueryCount(0):
-            self.assertUsers(n5.users, ['zaizee'])
+            with self.assertQueryCount(0):
+                self.assertUsers(n1.users, ['gargie'])
+            with self.assertQueryCount(0):
+                self.assertUsers(n2.users, ['gargie', 'huey'])
+            with self.assertQueryCount(0):
+                self.assertUsers(n5.users, ['zaizee'])
         with self.assertQueryCount(2):
             self.assertUsers(Note.create(text='x').users, [])
 
@@ -539,6 +380,189 @@ class TestManyToMany(ModelTestCase):
             self.assertUsers(n5.users, ['zaizee'])
 
 
+# ===========================================================================
+# Backref behavior, inheritance, and FK-to-non-PK
+# ===========================================================================
+
+class Student(TestModel):
+    name = TextField()
+
+CourseStudentDeferred = DeferredThroughModel()
+
+class Course(TestModel):
+    name = TextField()
+    students = ManyToManyField(Student, backref='+')
+    students2 = ManyToManyField(Student, through_model=CourseStudentDeferred)
+
+CourseStudent = Course.students.get_through_model()
+
+class CourseStudent2(TestModel):
+    course = ForeignKeyField(Course, backref='+')
+    student = ForeignKeyField(Student, backref='+')
+
+CourseStudentDeferred.set_model(CourseStudent2)
+
+
+class TestManyToManyBackrefBehavior(ModelTestCase):
+    requires = [Student, Course, CourseStudent, CourseStudent2]
+
+    def setUp(self):
+        super(TestManyToManyBackrefBehavior, self).setUp()
+        math = Course.create(name='math')
+        engl = Course.create(name='engl')
+        huey, mickey, zaizee = [Student.create(name=name)
+                                for name in ('huey', 'mickey', 'zaizee')]
+        # Set up relationships.
+        math.students.add([huey, zaizee])
+        engl.students.add([mickey])
+        math.students2.add([mickey])
+        engl.students2.add([huey, zaizee])
+
+    def test_manytomanyfield_disabled_backref(self):
+        # backref='+' adds no reverse M2M accessor on Student.
+        self.assertNotIn('+', Student._meta.manytomany)
+
+        math = Course.get(name='math')
+        query = math.students.order_by(Student.name)
+        self.assertEqual([s.name for s in query], ['huey', 'zaizee'])
+
+        huey = Student.get(name='huey')
+        math.students.remove(huey)
+        self.assertEqual([s.name for s in math.students], ['zaizee'])
+
+        # The backref is via the CourseStudent2 through-model.
+        self.assertEqual([c.name for c in huey.courses], ['engl'])
+
+    def test_through_model_disabled_backrefs(self):
+        # Here we're testing the case where the many-to-many field does not
+        # explicitly disable back-references, but the foreign-keys on the
+        # through model have disabled back-references.
+        engl = Course.get(name='engl')
+        query = engl.students2.order_by(Student.name)
+        self.assertEqual([s.name for s in query], ['huey', 'zaizee'])
+
+        zaizee = Student.get(Student.name == 'zaizee')
+        engl.students2.remove(zaizee)
+        self.assertEqual([s.name for s in engl.students2], ['huey'])
+
+        math = Course.get(name='math')
+        self.assertEqual([s.name for s in math.students2], ['mickey'])
+
+
+class TestManyToManyInheritance(ModelTestCase):
+    def test_manytomany_inheritance(self):
+        class BaseModel(TestModel):
+            class Meta:
+                database = self.database
+        class User(BaseModel):
+            username = TextField()
+        class Project(BaseModel):
+            name = TextField()
+            users = ManyToManyField(User, backref='projects')
+
+        def subclass_project():
+            class VProject(Project):
+                pass
+
+        # We cannot subclass Project, because the many-to-many field "users"
+        # will be inherited, but the through-model does not contain a
+        # foreign-key to VProject. The through-model in this case is
+        # ProjectUsers, which has foreign-keys to project and user.
+        self.assertRaises(ValueError, subclass_project)
+        PThrough = Project.users.through_model
+        self.assertTrue(PThrough.project.rel_model is Project)
+        self.assertTrue(PThrough.user.rel_model is User)
+
+
+class Color(TestModel):
+    name = CharField(unique=True)  # CharField: mysql cannot index TEXT.
+
+LogoColorDeferred = DeferredThroughModel()
+
+class Logo(TestModel):
+    name = CharField(unique=True)  # CharField: mysql cannot index TEXT.
+    colors = ManyToManyField(Color, through_model=LogoColorDeferred)
+
+class LogoColor(TestModel):
+    logo = ForeignKeyField(Logo, field=Logo.name)
+    color = ForeignKeyField(Color, field=Color.name)  # FK to non-PK column.
+
+LogoColorDeferred.set_model(LogoColor)
+
+
+class TestManyToManyFKtoNonPK(ModelTestCase):
+    requires = [Color, Logo, LogoColor]
+
+    def test_manytomany_fk_to_non_pk(self):
+        red = Color.create(name='red')
+        green = Color.create(name='green')
+        blue = Color.create(name='blue')
+        lrg = Logo.create(name='logo-rg')
+        lrb = Logo.create(name='logo-rb')
+        lrgb = Logo.create(name='logo-rgb')
+        lrg.colors.add([red, green])
+        lrb.colors.add([red, blue])
+        lrgb.colors.add([red, green, blue])
+
+        def assertColors(logo, expected):
+            colors = [c.name for c in logo.colors.order_by(Color.name)]
+            self.assertEqual(colors, expected)
+
+        assertColors(lrg, ['green', 'red'])
+        assertColors(lrb, ['blue', 'red'])
+        assertColors(lrgb, ['blue', 'green', 'red'])
+
+        def assertLogos(color, expected):
+            logos = [l.name for l in color.logos.order_by(Logo.name)]
+            self.assertEqual(logos, expected)
+
+        assertLogos(red, ['logo-rb', 'logo-rg', 'logo-rgb'])
+        assertLogos(green, ['logo-rg', 'logo-rgb'])
+        assertLogos(blue, ['logo-rb', 'logo-rgb'])
+
+        # Verify we can delete data as well.
+        lrg.colors.remove(red)
+        self.assertEqual([c.name for c in lrg.colors], ['green'])
+
+        blue.logos.remove(lrb)
+        self.assertEqual([c.name for c in lrb.colors], ['red'])
+
+        # Verify we can insert using a SELECT query.
+        lrg.colors.add(Color.select().where(Color.name != 'blue'), True)
+        assertColors(lrg, ['green', 'red'])
+
+        lrb.colors.add(Color.select().where(Color.name == 'blue'))
+        assertColors(lrb, ['blue', 'red'])
+
+        # Verify we can insert logos using a SELECT query.
+        black = Color.create(name='black')
+        black.logos.add(Logo.select().where(Logo.name != 'logo-rgb'))
+        assertLogos(black, ['logo-rb', 'logo-rg'])
+        assertColors(lrb, ['black', 'blue', 'red'])
+        assertColors(lrg, ['black', 'green', 'red'])
+        assertColors(lrgb, ['blue', 'green', 'red'])
+
+        # Verify we can delete using a SELECT query.
+        lrg.colors.remove(Color.select().where(Color.name == 'red'))
+        assertColors(lrg, ['black', 'green'])
+
+        black.logos.remove(Logo.select().where(Logo.name == 'logo-rg'))
+        assertLogos(black, ['logo-rb'])
+
+        # Verify we can clear.
+        lrg.colors.clear()
+        assertColors(lrg, [])
+        assertColors(lrb, ['black', 'blue', 'red'])  # Not affected.
+
+        black.logos.clear()
+        assertLogos(black, [])
+        assertLogos(red, ['logo-rb', 'logo-rgb'])
+
+
+# ===========================================================================
+# FK-as-PK M2M and multiple M2M between same tables
+# ===========================================================================
+
 class Person(TestModel):
     name = CharField()
 
@@ -553,7 +577,6 @@ AccountListThrough = AccountList.accounts.get_through_model()
 
 
 class TestForeignKeyPrimaryKeyManyToMany(ModelTestCase):
-    database = get_in_memory_db()
     requires = [Person, Account, AccountList, AccountListThrough]
     test_data = (
         ('huey', ('cats', 'evil')),
@@ -598,3 +621,145 @@ class TestForeignKeyPrimaryKeyManyToMany(ModelTestCase):
     def test_empty(self):
         al = AccountList.create(name='empty')
         self.assertEqual(list(al.accounts), [])
+
+
+class Permission(TestModel):
+    name = TextField()
+
+DeniedThroughDeferred = DeferredThroughModel()
+
+class Visitor(TestModel):
+    name = TextField()
+    allowed = ManyToManyField(Permission)
+    denied = ManyToManyField(Permission, through_model=DeniedThroughDeferred)
+
+class DeniedThrough(TestModel):
+    permission = ForeignKeyField(Permission)
+    visitor = ForeignKeyField(Visitor)
+
+DeniedThroughDeferred.set_model(DeniedThrough)
+
+
+class TestMultipleManyToManySameTables(ModelTestCase):
+    requires = [Permission, Visitor, Visitor.allowed.through_model,
+                Visitor.denied.through_model]
+
+    def test_multiple_manytomany_same_tables(self):
+        p1, p2, p3 = [Permission.create(name=n) for n in ('p1', 'p2', 'p3')]
+        v1, v2, v3 = [Visitor.create(name=n) for n in ('v1', 'v2', 'v3')]
+
+        v1.allowed.add([p1, p2, p3])
+        v2.allowed.add(p2)
+        v2.denied.add([p1, p3])
+        v3.allowed.add(p3)
+        v3.denied.add(p1)
+
+        accum = []
+        for v in Visitor.select().order_by(Visitor.name):
+            allowed, denied = [], []
+            for p in v.allowed.order_by(Permission.name):
+                allowed.append(p.name)
+            for p in v.denied.order_by(Permission.name):
+                denied.append(p.name)
+            accum.append((v.name, allowed, denied))
+
+        self.assertEqual(accum, [
+            ('v1', ['p1', 'p2', 'p3'], []),
+            ('v2', ['p2'], ['p1', 'p3']),
+            ('v3', ['p3'], ['p1'])])
+
+
+# ===========================================================================
+# Errors and edge-cases
+# ===========================================================================
+
+class TestManyToManyPreventUnsaved(ModelTestCase):
+    requires = [User, Note, NoteUserThrough]
+
+    def test_m2m_unsaved_raises(self):
+        n = Note(text='unsaved note')
+        # n has not been saved, so n.id is None.
+        with self.assertRaises(ValueError):
+            n.users  # Triggers ManyToManyFieldAccessor.__get__
+
+        with self.assertRaises(ValueError):
+            n.users = [User(username='u')]
+
+        u = User.create(username='huey')
+        n = Note.create(text='note1')
+
+        result = list(n.users)
+        self.assertEqual(result, [])
+
+        with self.assertRaises(IntegrityError):
+            # Cannot set instance with no primary key.
+            with self.database.atomic():
+                n.users = [User()]
+
+        n.users = [u]
+        result = list(n.users)
+        self.assertEqual(result, [u])
+
+
+class TestManyToManyInitErrors(ModelTestCase):
+
+    def test_invalid_through_model_type(self):
+        with self.assertRaises(TypeError):
+            ManyToManyField(User, through_model='not_a_model')
+
+    def test_on_delete_with_through_model_raises(self):
+        class DummyThrough(TestModel):
+            pass
+        with self.assertRaises(ValueError):
+            ManyToManyField(User, through_model=DummyThrough,
+                            on_delete='CASCADE')
+
+    def test_on_update_with_through_model_raises(self):
+        class DummyThrough(TestModel):
+            pass
+        with self.assertRaises(ValueError):
+            ManyToManyField(User, through_model=DummyThrough,
+                            on_update='CASCADE')
+
+
+class TestManyToManyEmptyOperations(ModelTestCase):
+    requires = [User, Note, NoteUserThrough]
+
+    def test_add_empty_list(self):
+        u = User.create(username='huey')
+        n = Note.create(text='note1')
+        n.users.add([])
+        self.assertEqual(list(n.users), [])
+
+    def test_remove_empty_list(self):
+        u = User.create(username='huey')
+        n = Note.create(text='note1')
+        n.users.add([u])
+        result = n.users.remove([])
+        # remove with empty list returns None (early exit).
+        self.assertIsNone(result)
+        # The relationship should still exist.
+        self.assertEqual(len(list(n.users)), 1)
+
+
+BangThroughDeferred = DeferredThroughModel()
+
+class BangNote(TestModel):
+    text = TextField()
+    users = ManyToManyField(User, through_model=BangThroughDeferred)
+
+class BangThroughModel(TestModel):
+    user = ForeignKeyField(User, backref='!')
+    note = ForeignKeyField(BangNote, backref='!')
+
+BangThroughDeferred.set_model(BangThroughModel)
+
+
+class TestM2MBangBackref(ModelTestCase):
+    requires = [User, BangNote, BangThroughModel]
+
+    def test_backref_bang_sentinel(self):
+        user = User.create(username='u1')
+        note = BangNote.create(text='n1')
+        BangThroughModel.create(user=user, note=note)
+        self.assertEqual([u.username for u in note.users], ['u1'])

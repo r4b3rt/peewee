@@ -1,26 +1,17 @@
-try:
-    from collections import OrderedDict
-except ImportError:
-    OrderedDict = dict
+import datetime
+import decimal
+import re
+import uuid
+import warnings
+from collections import OrderedDict
 from collections import namedtuple
 from inspect import isclass
-import re
-import warnings
 
 from peewee import *
 from peewee import _StringField
 from peewee import _query_val_transform
 from peewee import CommaNodeList
-from peewee import SCOPE_VALUES
 from peewee import make_snake_case
-from peewee import text_type
-try:
-    from pymysql.constants import FIELD_TYPE
-except ImportError:
-    try:
-        from MySQLdb.constants import FIELD_TYPE
-    except ImportError:
-        FIELD_TYPE = None
 try:
     from playhouse import postgres_ext
 except ImportError:
@@ -36,6 +27,32 @@ RESERVED_WORDS = set([
     'import', 'in', 'is', 'lambda', 'not', 'or', 'pass', 'print', 'raise',
     'return', 'try', 'while', 'with', 'yield',
 ])
+
+
+FieldTypeMap = {
+    'AUTO': int,
+    'BIGAUTO': int,
+    'BIGINT': int,
+    'BLOB': bytes,
+    'BOOL': bool,
+    'CHAR': str,
+    'DATE': datetime.date,
+    'DATETIME': datetime.datetime,
+    'DECIMAL': decimal.Decimal,
+    'DOUBLE': float,
+    'FLOAT': float,
+    'INT': int,
+    'SMALLINT': int,
+    'TEXT': str,
+    'TIME': datetime.time,
+    'UUID': uuid.UUID,
+    'UUIDB': bytes,
+    'VARCHAR': str,
+    'JSON': dict,
+    'JSONB': dict,
+    'TIMESTAMPTZ': datetime.datetime,
+    'INTERVAL': datetime.timedelta,
+}
 
 
 class UnknownField(object):
@@ -92,7 +109,8 @@ class Column(object):
         if self.primary_key and not issubclass(self.field_class, AutoField):
             params['primary_key'] = True
         if self.default is not None:
-            params['constraints'] = '[SQL("DEFAULT %s")]' % self.default
+            params['constraints'] = '[SQL("DEFAULT %s")]' % \
+                    self.default.replace('"', '\\"')
 
         # Handle ForeignKeyField-specific attributes.
         if self.is_foreign_key():
@@ -101,6 +119,12 @@ class Column(object):
                 params['field'] = "'%s'" % self.to_field
             if self.related_name:
                 params['backref'] = "'%s'" % self.related_name
+
+            fk = getattr(self, 'foreign_key', None)
+            for attr in ('on_delete', 'on_update'):
+                value = getattr(fk, attr, None) if fk else None
+                if value and value not in ('NO ACTION', 'RESTRICT'):
+                    params[attr] = "'%s'" % value
 
         # Handle indexes on column.
         if not self.is_primary_key():
@@ -125,6 +149,7 @@ class Column(object):
                         related_name=None):
         self.foreign_key = foreign_key
         self.field_class = ForeignKeyField
+        self.extra_parameters = None  # e.g. max_length does not apply to FK.
         if foreign_key.dest_table == foreign_key.table:
             self.rel_model = "'self'"
         else:
@@ -156,10 +181,14 @@ class Column(object):
 class Metadata(object):
     column_map = {}
     extension_import = ''
+    # e.g. VARCHAR(255), NUMERIC(1, 2)
+    re_type_params = re.compile(r'^\s*[\w ]+\(\s*(\d+)\s*(?:,\s*(\d+))?\s*\)')
 
     def __init__(self, database):
         self.database = database
         self.requires_extension = False
+        # Copy so live-probed types do not accumulate on the class-level map.
+        self.column_map = dict(self.column_map)
 
     def execute(self, sql, *params):
         return self.database.execute_sql(sql, params)
@@ -172,19 +201,25 @@ class Metadata(object):
         # Look up the actual column type for each column.
         column_types, extra_params = self.get_column_types(table, schema)
 
-        # Look up the primary keys.
-        pk_names = self.get_primary_keys(table, schema)
+        # Only promote a lone primary key to auto-incrementing when the
+        # column actually is.
+        pk_names = [name for name, m in metadata.items() if m.primary_key]
         if len(pk_names) == 1:
             pk = pk_names[0]
-            if column_types[pk] is IntegerField:
-                column_types[pk] = AutoField
-            elif column_types[pk] is BigIntegerField:
-                column_types[pk] = BigAutoField
+            if metadata[pk].identity:
+                if column_types[pk] is IntegerField:
+                    column_types[pk] = AutoField
+                elif column_types[pk] is BigIntegerField:
+                    column_types[pk] = BigAutoField
 
         columns = OrderedDict()
         for name, column_data in metadata.items():
             field_class = column_types[name]
             default = self._clean_default(field_class, column_data.default)
+            extra = extra_params.get(name)
+            type_params = self._extract_type_params(field_class, column_data)
+            if type_params:
+                extra = dict(extra or {}, **type_params)
 
             columns[name] = Column(
                 name,
@@ -194,19 +229,32 @@ class Metadata(object):
                 primary_key=column_data.primary_key,
                 column_name=name,
                 default=default,
-                extra_parameters=extra_params.get(name))
+                extra_parameters=extra)
 
         return columns
 
     def get_column_types(self, table, schema=None):
         raise NotImplementedError
 
+    def _extract_type_params(self, field_class, column_data):
+        # Recover length or precision/scale from the parameterized type,
+        # omitting values that match the field-class defaults.
+        match = self.re_type_params.match(column_data.full_type or '')
+        if match is None:
+            return
+        p1, p2 = match.groups()
+        if issubclass(field_class, CharField) and int(p1) != 255:
+            return {'max_length': int(p1)}
+        elif issubclass(field_class, DecimalField) and p2 is not None:
+            if (int(p1), int(p2)) != (10, 5):
+                return {'max_digits': int(p1), 'decimal_places': int(p2)}
+
     def _clean_default(self, field_class, default):
         if default is None or field_class in (AutoField, BigAutoField) or \
            default.lower() == 'null':
             return
         if issubclass(field_class, _StringField) and \
-           isinstance(default, text_type) and not default.startswith("'"):
+           isinstance(default, str) and not default.startswith("'"):
             default = "'%s'" % default
         return default or "''"
 
@@ -278,7 +326,7 @@ class PostgresqlMetadata(Metadata):
             for oid in self.array_types:
                 self.column_map[oid] = postgres_ext.ArrayField
 
-    def get_column_types(self, table, schema):
+    def get_column_types(self, table, schema=None):
         column_types = {}
         extra_params = {}
         extension_types = set((
@@ -289,10 +337,16 @@ class PostgresqlMetadata(Metadata):
             postgres_ext.HStoreField)) if postgres_ext is not None else set()
 
         # Look up the actual column type for each column.
-        identifier = '%s."%s"' % (schema, table)
         cursor = self.execute(
-            'SELECT attname, atttypid FROM pg_catalog.pg_attribute '
-            'WHERE attrelid = %s::regclass AND attnum > %s', identifier, 0)
+            'SELECT a.attname, a.atttypid '
+            'FROM pg_catalog.pg_attribute AS a '
+            'INNER JOIN pg_catalog.pg_class AS t ON a.attrelid = t.oid '
+            'INNER JOIN pg_catalog.pg_namespace AS n '
+            'ON t.relnamespace = n.oid '
+            'WHERE t.relname = %s '
+            'AND n.nspname = COALESCE(%s, current_schema()) '
+            'AND a.attnum > 0 AND NOT a.attisdropped '
+            'ORDER BY a.attnum', table, schema)
 
         # Store column metadata in dictionary keyed by column name.
         for name, oid in cursor.fetchall():
@@ -303,22 +357,6 @@ class PostgresqlMetadata(Metadata):
                 extra_params[name] = {'field_class': self.array_types[oid]}
 
         return column_types, extra_params
-
-    def get_columns(self, table, schema=None):
-        schema = schema or 'public'
-        return super(PostgresqlMetadata, self).get_columns(table, schema)
-
-    def get_foreign_keys(self, table, schema=None):
-        schema = schema or 'public'
-        return super(PostgresqlMetadata, self).get_foreign_keys(table, schema)
-
-    def get_primary_keys(self, table, schema=None):
-        schema = schema or 'public'
-        return super(PostgresqlMetadata, self).get_primary_keys(table, schema)
-
-    def get_indexes(self, table, schema=None):
-        schema = schema or 'public'
-        return super(PostgresqlMetadata, self).get_indexes(table, schema)
 
 
 class CockroachDBMetadata(PostgresqlMetadata):
@@ -349,47 +387,53 @@ class CockroachDBMetadata(PostgresqlMetadata):
 
 
 class MySQLMetadata(Metadata):
-    if FIELD_TYPE is None:
-        column_map = {}
-    else:
-        column_map = {
-            FIELD_TYPE.BLOB: TextField,
-            FIELD_TYPE.CHAR: CharField,
-            FIELD_TYPE.DATE: DateField,
-            FIELD_TYPE.DATETIME: DateTimeField,
-            FIELD_TYPE.DECIMAL: DecimalField,
-            FIELD_TYPE.DOUBLE: FloatField,
-            FIELD_TYPE.FLOAT: FloatField,
-            FIELD_TYPE.INT24: IntegerField,
-            FIELD_TYPE.LONG_BLOB: TextField,
-            FIELD_TYPE.LONG: IntegerField,
-            FIELD_TYPE.LONGLONG: BigIntegerField,
-            FIELD_TYPE.MEDIUM_BLOB: TextField,
-            FIELD_TYPE.NEWDECIMAL: DecimalField,
-            FIELD_TYPE.SHORT: IntegerField,
-            FIELD_TYPE.STRING: CharField,
-            FIELD_TYPE.TIMESTAMP: DateTimeField,
-            FIELD_TYPE.TIME: TimeField,
-            FIELD_TYPE.TINY_BLOB: TextField,
-            FIELD_TYPE.TINY: IntegerField,
-            FIELD_TYPE.VAR_STRING: CharField,
-        }
-
-    def __init__(self, database, **kwargs):
-        if 'password' in kwargs:
-            kwargs['passwd'] = kwargs.pop('password')
-        super(MySQLMetadata, self).__init__(database, **kwargs)
+    column_map = {
+        'bigint': BigIntegerField,
+        'binary': BlobField,
+        'blob': BlobField,
+        'char': CharField,
+        'date': DateField,
+        'datetime': DateTimeField,
+        'decimal': DecimalField,
+        'double': DoubleField,
+        'enum': CharField,
+        'float': FloatField,
+        'int': IntegerField,
+        'integer': IntegerField,
+        'longblob': BlobField,
+        'longtext': TextField,
+        'mediumblob': BlobField,
+        'mediumint': IntegerField,
+        'mediumtext': TextField,
+        'numeric': DecimalField,
+        'smallint': SmallIntegerField,
+        'text': TextField,
+        'time': TimeField,
+        'timestamp': DateTimeField,
+        'tinyblob': BlobField,
+        'tinyint': IntegerField,
+        'tinytext': TextField,
+        'varbinary': BlobField,
+        'varchar': CharField,
+        'year': IntegerField,
+    }
 
     def get_column_types(self, table, schema=None):
         column_types = {}
 
-        # Look up the actual column type for each column.
-        cursor = self.execute('SELECT * FROM `%s` LIMIT 1' % table)
-
-        # Store column metadata in dictionary keyed by column name.
-        for column_description in cursor.description:
-            name, type_code = column_description[:2]
-            column_types[name] = self.column_map.get(type_code, UnknownField)
+        cursor = self.execute(
+            'SELECT column_name, data_type, column_type '
+            'FROM information_schema.columns '
+            'WHERE table_name = %s '
+            'AND table_schema = COALESCE(%s, DATABASE())', table, schema)
+        for name, data_type, column_type in cursor.fetchall():
+            if column_type == 'tinyint(1)':
+                column_types[name] = BooleanField
+            elif data_type.lower() == 'json':
+                column_types[name] = JSONField
+            else:
+                column_types[name] = self.column_map.get(data_type.lower(),
+                                                         UnknownField)
 
         return column_types, {}
 
@@ -419,13 +463,13 @@ class SqliteMetadata(Metadata):
         'varchar': CharField,
     }
 
-    begin = '(?:["\[\(]+)?'
-    end = '(?:["\]\)]+)?'
+    begin = r'(?:["\[\(]+)?'
+    end = r'(?:["\]\)]+)?'
     re_foreign_key = (
-        '(?:FOREIGN KEY\s*)?'
-        '{begin}(.+?){end}\s+(?:.+\s+)?'
-        'references\s+{begin}(.+?){end}'
-        '\s*\(["|\[]?(.+?)["|\]]?\)').format(begin=begin, end=end)
+        r'(?:FOREIGN KEY\s*)?'
+        r'{begin}(.+?){end}\s+(?:.+\s+)?'
+        r'references\s+{begin}(.+?){end}'
+        r'\s*\(["|\[]?(.+?)["|\]]?\)').format(begin=begin, end=end)
     re_varchar = r'^\s*(?:var)?char\s*\(\s*(\d+)\s*\)\s*$'
 
     def _map_col(self, column_type):
@@ -435,7 +479,7 @@ class SqliteMetadata(Metadata):
         elif re.search(self.re_varchar, raw_column_type):
             field_class = CharField
         else:
-            column_type = re.sub('\(.+\)', '', raw_column_type)
+            column_type = re.sub(r'\(.+\)', '', raw_column_type)
             if column_type == '':
                 field_class = BareField
             else:
@@ -452,6 +496,18 @@ class SqliteMetadata(Metadata):
         return column_types, {}
 
 
+def _is_index_usable(index, column_names):
+    # Expression-index columns come back as None (sqlite) or as expression
+    # text (postgres), while partial indexes carry a WHERE clause in their DDL.
+    # Ignore these.
+    for column in index.columns:
+        if column is None or column not in column_names:
+            return False
+    if index.sql and re.search(r'\)\s*WHERE\s', index.sql, re.I):
+        return False
+    return True
+
+
 _DatabaseMetadata = namedtuple('_DatabaseMetadata', (
     'columns',
     'primary_keys',
@@ -464,19 +520,24 @@ class DatabaseMetadata(_DatabaseMetadata):
     def multi_column_indexes(self, table):
         accum = []
         for index in self.indexes[table]:
-            if len(index.columns) > 1:
+            if len(index.columns) > 1 and \
+               _is_index_usable(index, set(self.columns[table])):
                 field_names = [self.columns[table][column].name
-                               for column in index.columns
-                               if column in self.columns[table]]
+                               for column in index.columns]
                 accum.append((field_names, index.unique))
         return accum
 
     def column_indexes(self, table):
         accum = {}
         for index in self.indexes[table]:
-            if len(index.columns) == 1:
+            if len(index.columns) == 1 and \
+               _is_index_usable(index, set(self.columns[table])):
                 accum[index.columns[0]] = index.unique
         return accum
+
+    def unhandled_indexes(self, table):
+        return [index for index in self.indexes[table]
+                if not _is_index_usable(index, set(self.columns[table]))]
 
 
 class Introspector(object):
@@ -556,6 +617,7 @@ class Introspector(object):
             views = self.metadata.database.get_views(schema=self.schema)
             tables.extend([view.name for view in views])
 
+        schema_tables = set(tables)
         if table_names is not None:
             tables = [table for table in tables if table in table_names]
         table_set = set(tables)
@@ -563,7 +625,7 @@ class Introspector(object):
         # Store a mapping of table name -> dictionary of columns.
         columns = {}
 
-        # Store a mapping of table name -> set of primary key columns.
+        # Store a mapping of table name -> primary key columns, in key order.
         primary_keys = {}
 
         # Store a mapping of table -> foreign keys.
@@ -583,9 +645,21 @@ class Introspector(object):
                 foreign_keys[table] = self.metadata.get_foreign_keys(
                     table, self.schema)
             except ValueError as exc:
-                err(*exc.args)
                 foreign_keys[table] = []
             else:
+                # Drop foreign-keys targeting tables outside the schema, e.g.
+                # cross-schema references. The column is left as-is.
+                keep = []
+                for foreign_key in foreign_keys[table]:
+                    if foreign_key.dest_table in schema_tables:
+                        keep.append(foreign_key)
+                    else:
+                        warnings.warn('Ignoring foreign-key %s.%s, "%s" was '
+                                      'not introspected.' %
+                                      (table, foreign_key.column,
+                                       foreign_key.dest_table))
+                foreign_keys[table] = keep
+
                 # If there is a possibility we could exclude a dependent table,
                 # ensure that we introspect it so FKs will work.
                 if table_names is not None:
@@ -618,11 +692,11 @@ class Introspector(object):
                 column.name = new_name
 
             for index in table_indexes:
-                if len(index.columns) == 1:
+                if len(index.columns) == 1 and \
+                   _is_index_usable(index, set(table_columns)):
                     column = index.columns[0]
-                    if column in table_columns:
-                        table_columns[column].unique = index.unique
-                        table_columns[column].index = True
+                    table_columns[column].unique = index.unique
+                    table_columns[column].index = True
 
             primary_keys[table] = self.metadata.get_primary_keys(
                 table, self.schema)
@@ -699,11 +773,9 @@ class Introspector(object):
                     else:
                         _create_model(dest, models)
 
-            primary_keys = []
             columns = database.columns[table]
-            for column_name, column in columns.items():
-                if column.primary_key:
-                    primary_keys.append(column.name)
+            primary_keys = [columns[col].name
+                            for col in database.primary_keys[table]]
 
             multi_column_indexes = database.multi_column_indexes(table)
             column_indexes = database.column_indexes(table)
@@ -712,14 +784,11 @@ class Introspector(object):
                 indexes = multi_column_indexes
                 table_name = table
 
-            # Fix models with multi-column primary keys.
             composite_key = False
-            if len(primary_keys) == 0:
-                primary_keys = columns.keys()
-            if len(primary_keys) > 1:
-                Meta.primary_key = CompositeKey(*[
-                    field.name for col, field in columns.items()
-                    if col in primary_keys])
+            if not primary_keys:
+                Meta.primary_key = False
+            elif len(primary_keys) > 1:
+                Meta.primary_key = CompositeKey(*primary_keys)
                 composite_key = True
 
             attrs = {'Meta': Meta}
@@ -733,6 +802,10 @@ class Introspector(object):
                 params = {
                     'column_name': column_name,
                     'null': column.nullable}
+                if column.extra_parameters is not None and \
+                   FieldClass is not BareField:
+                    # e.g. max_length does not apply to BareField.
+                    params.update(column.extra_parameters)
                 if column.primary_key and composite_key:
                     if FieldClass is AutoField:
                         FieldClass = IntegerField
@@ -755,16 +828,23 @@ class Introspector(object):
                     # Generate a unique related name.
                     params['backref'] = '%s_%s_rel' % (table, column_name)
 
+                    for attr in ('on_delete', 'on_update'):
+                        value = getattr(column.foreign_key, attr, None)
+                        if value and value not in ('NO ACTION', 'RESTRICT'):
+                            params[attr] = value
+
                 if column.default is not None:
                     constraint = SQL('DEFAULT %s' % column.default)
                     params['constraints'] = [constraint]
 
-                if column_name in column_indexes and not \
-                   column.is_primary_key():
-                    if column_indexes[column_name]:
-                        params['unique'] = True
-                    elif not column.is_foreign_key():
-                        params['index'] = True
+                if not column.is_primary_key():
+                    if column_name in column_indexes:
+                        if column_indexes[column_name]:
+                            params['unique'] = True
+                        elif not column.is_foreign_key():
+                            params['index'] = True
+                    else:
+                        params['index'] = False
 
                 attrs[column.name] = FieldClass(**params)
 
@@ -822,7 +902,7 @@ def print_model(model, indexes=True, inline_indexes=False):
             ctx = model._meta.database.get_sql_context()
             with ctx.scope_values(param='%s', quote='""'):
                 ctx.sql(CommaNodeList(index._expressions))
-                if index._where:
+                if index._where is not None:
                     ctx.literal(' WHERE ')
                     ctx.sql(index._where)
                 sql, params = ctx.query()
@@ -841,7 +921,7 @@ def get_table_sql(model):
         sql = sql.replace(model._meta.database.param, '%s')
 
     # Format and indent the table declaration, simplest possible approach.
-    match_obj = re.match('^(.+?\()(.+)(\).*)', sql)
+    match_obj = re.match(r'^(.+?\()(.+)(\).*)', sql)
     create, columns, extra = match_obj.groups()
     indented = ',\n'.join('  %s' % column for column in columns.split(', '))
 

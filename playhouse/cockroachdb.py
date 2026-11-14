@@ -1,15 +1,11 @@
 import functools
 import re
-import sys
 
 from peewee import *
 from peewee import _atomic
 from peewee import _manual
-from peewee import ColumnMetadata  # (name, data_type, null, primary_key, table, default)
 from peewee import EnclosedNodeList
 from peewee import Entity
-from peewee import ForeignKeyMetadata  # (column, dest_table, dest_column, table).
-from peewee import IndexMetadata
 from peewee import NodeList
 from playhouse.pool import _PooledPostgresqlDatabase
 try:
@@ -19,9 +15,6 @@ try:
     JSONField = BinaryJSONField
 except ImportError:  # psycopg2 not installed, ignore.
     ArrayField = BinaryJSONField = IntervalField = JSONField = None
-
-if sys.version_info[0] > 2:
-    basestring = str
 
 
 NESTED_TX_MIN_VERSION = 200100
@@ -62,10 +55,6 @@ class CockroachDatabase(PostgresqlDatabase):
         'BLOB': 'BYTES',
     })
 
-    for_update = False
-    nulls_ordering = False
-    release_after_rollback = True
-
     def __init__(self, database, *args, **kwargs):
         # Unless a DSN or database connection-url were specified, provide
         # convenient defaults for the user and port.
@@ -90,10 +79,10 @@ class CockroachDatabase(PostgresqlDatabase):
     def _get_pk_constraint(self, table, schema=None):
         query = ('SELECT constraint_name '
                  'FROM information_schema.table_constraints '
-                 'WHERE table_name = %s AND table_schema = %s '
+                 'WHERE table_name = %s '
+                 'AND table_schema = COALESCE(%s, current_schema()) '
                  'AND constraint_type = %s')
-        cursor = self.execute_sql(query, (table, schema or 'public',
-                                          'PRIMARY KEY'))
+        cursor = self.execute_sql(query, (table, schema, 'PRIMARY KEY'))
         row = cursor.fetchone()
         return row and row[0] or None
 
@@ -121,7 +110,7 @@ class CockroachDatabase(PostgresqlDatabase):
             parts = [SQL('ON CONFLICT')]
             if oc._conflict_target:
                 parts.append(EnclosedNodeList([
-                    Entity(col) if isinstance(col, basestring) else col
+                    Entity(col) if isinstance(col, str) else col
                     for col in oc._conflict_target]))
             parts.append(SQL('DO NOTHING'))
             return NodeList(parts)
@@ -146,21 +135,22 @@ class CockroachDatabase(PostgresqlDatabase):
     def begin(self, system_time=None, priority=None):
         super(CockroachDatabase, self).begin()
         if system_time is not None:
-            self.execute_sql('SET TRANSACTION AS OF SYSTEM TIME %s',
-                             (system_time,), commit=False)
+            self.cursor().execute('SET TRANSACTION AS OF SYSTEM TIME %s',
+                                  (system_time,))
         if priority is not None:
             priority = priority.lower()
             if priority not in ('low', 'normal', 'high'):
                 raise ValueError('priority must be low, normal or high')
-            self.execute_sql('SET TRANSACTION PRIORITY %s' % priority,
-                             commit=False)
+            self.cursor().execute('SET TRANSACTION PRIORITY %s' % priority)
 
     def atomic(self, system_time=None, priority=None):
+        if self.is_closed(): self.connect()  # Side-effect, set server version.
         if self.server_version < NESTED_TX_MIN_VERSION:
             return _crdb_atomic(self, system_time, priority)
         return super(CockroachDatabase, self).atomic(system_time, priority)
 
     def savepoint(self):
+        if self.is_closed(): self.connect()  # Side-effect, set server version.
         if self.server_version < NESTED_TX_MIN_VERSION:
             raise NotImplementedError(TXN_ERR_MSG)
         return super(CockroachDatabase, self).savepoint()
@@ -212,7 +202,9 @@ def run_transaction(db, callback, max_attempts=None, system_time=None,
                 db.execute_sql('RELEASE SAVEPOINT cockroach_restart')
                 return result
             except OperationalError as exc:
-                if exc.orig.pgcode == '40001':
+                code = (getattr(exc.orig, 'pgcode', None) or
+                        getattr(exc.orig, 'sqlstate', None))
+                if code == '40001':
                     max_attempts -= 1
                     db.execute_sql('ROLLBACK TO SAVEPOINT cockroach_restart')
                     continue

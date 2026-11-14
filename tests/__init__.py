@@ -1,86 +1,134 @@
-import sys
 import unittest
 
+from peewee import ImproperlyConfigured
+from peewee import NotSupportedError
 from peewee import OperationalError
 
+# Each test module is collected as its own suite, so a duplicate class
+# name across modules cannot shadow another module's tests.
+MODULES = []
+
 # Core modules.
-from .db_tests import *
-from .expressions import *
-from .fields import *
-from .keys import *
-from .manytomany import *
-from .models import *
-from .model_save import *
-from .model_sql import *
-from .prefetch_tests import *
-from .queries import *
-from .regressions import *
-from .results import *
-from .schema import *
-from .sql import *
-from .transactions import *
+from . import db_tests
+MODULES.append(db_tests)
+from . import fields
+MODULES.append(fields)
+from . import manytomany
+MODULES.append(manytomany)
+from . import models
+MODULES.append(models)
+from . import model_sql
+MODULES.append(model_sql)
+from . import prefetch_tests
+MODULES.append(prefetch_tests)
+from . import results
+MODULES.append(results)
+from . import schema
+MODULES.append(schema)
+from . import sql
+MODULES.append(sql)
+from . import transactions
+MODULES.append(transactions)
+from . import with_related_tests
+MODULES.append(with_related_tests)
 
 # Extensions.
 try:
-    from .apsw_ext import *
+    from . import apsw_ext
+    MODULES.append(apsw_ext)
 except ImportError:
     print('Unable to import APSW extension tests, skipping.')
+from . import cockroachdb
+MODULES.append(cockroachdb)
 try:
-    from .cockroachdb import *
-except:
-    print('Unable to import CockroachDB tests, skipping.')
-try:
-    from .cysqlite import *
+    from . import cysqlite_ext
+    MODULES.append(cysqlite_ext)
 except ImportError:
-    print('Unable to import sqlite C extension tests, skipping.')
-from .dataset import *
-from .db_url import *
-from .extra_fields import *
-from .hybrid import *
-from .kv import *
-from .migrations import *
+    print('Unable to import cysqlite tests, skipping.')
+from . import dataset
+MODULES.append(dataset)
+from . import db_url
+MODULES.append(db_url)
+from . import extra_fields
+MODULES.append(extra_fields)
 try:
-    import mysql.connector
-    from .mysql_ext import *
+    from . import flask_utils
+    MODULES.append(flask_utils)
 except ImportError:
-    print('Unable to import mysql-connector, skipping mysql_ext tests.')
-from .pool import *
+    print('Unable to import flask tests, skipping.')
 try:
-    from .postgres import *
+    from . import fts_parser
+    MODULES.append(fts_parser)
+except ImportError:
+    print('Unable to import fts parser tests, skipping.')
+from . import hybrid
+MODULES.append(hybrid)
+try:
+    from . import json_field
+    MODULES.append(json_field)
+except NotSupportedError:
+    print('Unable to import json_field tests, requires sqlite >= 3.38.')
+from . import kv
+MODULES.append(kv)
+from . import migrations
+MODULES.append(migrations)
+from . import mysql_ext
+MODULES.append(mysql_ext)
+from . import pool
+MODULES.append(pool)
+from . import schema_diff
+MODULES.append(schema_diff)
+try:
+    from . import postgres
+    MODULES.append(postgres)
 except (ImportError, ImproperlyConfigured):
     print('Unable to import postgres extension tests, skipping.')
 except OperationalError:
     print('Postgresql test database "peewee_test" not found, skipping '
           'the postgres_ext tests.')
-from .pwiz_integration import *
-from .reflection import *
-from .returning import *
-from .shortcuts import *
-from .signals import *
+from . import pwiz_integration
+MODULES.append(pwiz_integration)
+from . import reflection
+MODULES.append(reflection)
+from . import shortcuts
+MODULES.append(shortcuts)
+from . import signals
+MODULES.append(signals)
 try:
-    from .sqlcipher_ext import *
+    from . import sqlcipher_ext
+    MODULES.append(sqlcipher_ext)
 except ImportError:
     print('Unable to import SQLCipher extension tests, skipping.')
 try:
-    from .sqlite import *
+    from . import sqlite
+    MODULES.append(sqlite)
 except ImportError:
     print('Unable to import sqlite extension tests, skipping.')
 try:
-    from .sqlite_changelog import *
+    from . import sqlite_changelog
+    MODULES.append(sqlite_changelog)
 except ImportError:
     print('Unable to import sqlite changelog tests, skipping.')
-from .sqliteq import *
-from .sqlite_udf import *
-from .test_utils import *
+from . import sqliteq
+MODULES.append(sqliteq)
+from . import sqlite_udf
+MODULES.append(sqlite_udf)
+from . import test_utils
+MODULES.append(test_utils)
+try:
+    from . import pwasyncio
+    MODULES.append(pwasyncio)
+except (ImportError, SyntaxError):
+    print('Unable to import asyncio tests, skipping.')
+try:
+    from . import pydantic_utils
+    MODULES.append(pydantic_utils)
+except (ImportError, SyntaxError):
+    print('Unable to import pydantic tests, skipping.')
 
 
-if __name__ == '__main__':
-    from peewee import print_
-    print_("""\033[1;31m
-     ______   ______     ______     __     __     ______     ______
-    /\  == \ /\  ___\   /\  ___\   /\ \  _ \ \   /\  ___\   /\  ___\\
-    \ \  _-/ \ \  __\   \ \  __\   \ \ \/ ".\ \  \ \  __\   \ \  __\\
-     \ \_\    \ \_____\  \ \_____\  \ \__/".~\_\  \ \_____\  \ \_____\\
-      \/_/     \/_____/   \/_____/   \/_/   \/_/   \/_____/   \/_____/
-    \033[0m""")
-    unittest.main(argv=sys.argv)
+def load_tests(loader, tests, pattern):
+    suite = unittest.TestSuite()
+    for module in MODULES:
+        suite.addTests(loader.loadTestsFromModule(module))
+    return suite

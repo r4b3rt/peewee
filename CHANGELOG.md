@@ -7,9 +7,1002 @@ https://github.com/coleifer/peewee/releases
 
 ## master
 
+* Clear `after_commit` callbacks registered on a savepoint if that savepoint is
+  then rolled-back.
+* Re-create triggers during sqlite migrator table rebuilds.
+* Booleans inlined into SQL render as `TRUE` / `FALSE` instead of `1` / `0`.
+  Fixes partial indexes on a boolean under psycopg3. Also changes the output
+  of `query_to_string()`.
+* `SchemaMigrator.add_column_default()` inlines its value under psycopg3,
+  which cannot bind parameters in DDL.
+
+[View commits](https://github.com/coleifer/peewee/compare/4.5.3...master)
+
+## 4.5.3
+
+* JSON path keys on Postgres are rendered inline (`data->>'key'`,
+  `'{"a","b"}'::text[]`) instead of as bound parameters, so `GROUP BY` and
+  `ORDER BY` on a JSON lookup work under psycopg3, which binds each occurrence
+  of a key as a distinct parameter. Applies to the core `JSONField` and to
+  `playhouse.postgres_ext`.
+* `Cast()` and other wrapped nodes over a plain value no longer break result
+  row processing.
+* A write query with a `RETURNING` clause now runs again on every explicit
+  `execute()` call (like a write query without one). Iterating the query still
+  reads the result of the last execution. Previously repeated `execute()`
+  calls returned the cached result without running the query.
+* Fix regression in model select `.exists()`, #3086.
+
+[View commits](https://github.com/coleifer/peewee/compare/4.5.2...4.5.3)
+
+## 4.5.2
+
+* Don't cache ``None`` on unselected FK join trees, see #3083.
+* Some fixes for edge-cases around non-unique aliases and unicode aliases,
+  see #3081 and #3078.
+* Ensure subqueries get appropriate parens inside single argument functions.
+  Functions that do not want the extra parens (exists, e.g.) will not add extra
+  parens.
+* `exists()` wraps the query in `EXISTS(...)` rather than replacing its
+  columns, fixing queries that order by or filter on a selected alias, and
+  queries on MySQL that select two columns w/the same name.
+* Composite primary key columns are introspected in key-order.
+
+[View commits](https://github.com/coleifer/peewee/compare/4.5.1...4.5.2)
+
+## 4.5.1
+
+* `EnumField` and `IntEnumField` validate member value types (`str` and
+  `int` respectively) at field construction.
+* `EnumField` and `IntEnumField` default `choices` to `(value, name)` pairs
+  derived from the enum.
+* Fix #3075, migration generation for `EnumField`. Generated migrations will
+  emit the storage field type (e.g. `IntegerField`) rather than `EnumField()`.
+
+[View commits](https://github.com/coleifer/peewee/compare/4.5.0...4.5.1)
+
+## 4.5.0
+
+Backwards-incompatible:
+
+* MySQL and MariaDB connections no longer set `sql_mode`. Peewee had been
+  setting `PIPES_AS_CONCAT`, but the param replaced the server's mode rather
+  than adding to it, which silently disabled `STRICT_TRANS_TABLES` (etc).
+  Going forward Peewee will not modify `sql_mode` by default and use
+  `CONCAT()` rather than `||` for MySQL/MariaDB.
+* MySQL and MariaDB connection charset defaults to `utf8mb4` instead of `utf8`,
+  which is an alias for `utf8mb3` and cannot store 4-byte characters.
+* A field's `sequence=` is now qualified with the model's `Meta.schema`. If the
+  name you pass already contains a dot it is treated as fully-qualified and
+  used as-is, so `sequence='other.seq'` is unaffected by `Meta.schema`. Also,
+  `sequence_exists()` accepts a schema-qualified name.
+* SQLite `BEGIN`, `COMMIT` and `ROLLBACK` are issued directly on a cursor
+  rather than through `execute_sql()`, so they are no longer debug-logged, do
+  not fire query hooks and are not counted by `count_queries()`. This matches
+  Postgres and MySQL.
+* `atomic()` and `transaction()` on a closed database with `autoconnect=False`
+  now raise `InterfaceError` on Postgres and MySQL, as they already did on
+  SQLite (and as queries do). Previously `begin()` opened a connection
+  regardless of `autoconnect`.
+
+Improvements:
+
+* Add `SqliteDatabase(..., lock_type=...)` to set the default locking strategy
+  for transactions that do not specify one, e.g. `lock_type='IMMEDIATE'`.
+* Postgres introspection (`get_tables()`, `get_columns()`, `get_indexes()`,
+  `get_primary_keys()`, `get_foreign_keys()`, `get_views()`) with no `schema`
+  now follows the search path via `current_schema()` instead of assuming
+  `public`, matching MySQL's `DATABASE()` behavior.
+* Add `Runner(db, schema=...)` and `pwmigrate --schema` for running
+  migrations against a specific schema. The history table lives in that
+  schema, so each schema tracks its own applied set and one set of migration
+  files can be run against any number of schemas.
+* Add `SchemaMigrator(db, schema=...)`, which qualifies every table name w/the
+  given schema (or database on MySQL). Not supported for SQLite, as the
+  table-rebuild rewrites DDL straight from `sqlite_master`.
+* Add `websearch=True` to `TSVectorField.match()` and `Match()` to parse the
+  query using `websearch_to_tsquery()` (pg 11+). Accepts user input without
+  raising (quoted phrases, `or`, and `-negation`).
+* Add `Database.query_hooks`, a list of callables invoked after every query
+  with a `QueryEvent` named tuple (`sql`, `params`, `duration`, `exception`),
+  on success and failure both. No timing overhead when the list is empty.
+* Add `Database.after_commit(fn)`, which runs a callable after the outermost
+  transaction commits. Hook is discarded on rollback and runs immediately if
+  no transaction is active. Use for, e.g., writing a row PK to a task queue.
+* Add `EnumField` and `IntEnumField` to `playhouse.fields`, storing
+  `member.value` and returning the member, rejecting unknown values on write
+  and comparison. `to_pydantic()` maps any field with an `enum_class`
+  attribute to the enum itself, so schemas validate membership.
+* Add `Database.dispose()` / `PooledDatabase.dispose()` for discarding and
+  resetting local connection state, e.g. in a child process after `fork()`.
+* `Model.bind_ctx()` and `Database.bind_ctx()` can be used as decorators, like
+  the other peewee context-managers. Previously the decorator form raised
+  `TypeError: '_BoundModelsContext' object is not callable`.
+* `TimeField` supports utc offsets like `DateTimeField`, parsing e.g.
+  `'11:12:13+02:00'` to an aware `datetime.time` instead of returning `str`.
+  Only sqlite stores the offset. The postgres/mysql drivers drop it on write.
+
+[View commits](https://github.com/coleifer/peewee/compare/4.4.0...4.5.0)
+
+## 4.4.0
+
+In which we learn to migrate (somewhat).
+
+* Add `playhouse.migrations` for running migration scripts. Migrations are
+  python files defining `up(migrator, db)` and optionally `down(...)`.
+  Migrations are applied in numeric order a-la Django, and stored by name in a
+  history table. CLI via `pwmigrate` accepting `status`, `up`, `down`,
+  `initial`, `create`, `generate`, `fake` and `diff`. To run from python,
+  `migrations.run(db)`.
+* Add basic `playhouse.schema_diff` for comparing models against the
+  schema and reporting differences (tables to create, columns added or
+  removed, indexes added or removed).
+* Allow adding column to existing table as `NOT NULL` with migrator, which
+  allows skipping the 3-step process of add nullable, populate default, set not
+  null.
+* `db_url.connect()` raises `ValueError` for a url with no database name,
+  e.g. `postgres://dbname` (two slashes reads `dbname` as the host).
+* Add a `SchemaMigrator.migration_context()` helper for wrapping migrations.
+  This was wanted for SQLite in order to disable FK pragma, which could trigger
+  cascading deletes while recreating tables.
+* Allow `SchemaMigrator.from_database()` to support database proxies.
+* Add support for newer SQLite ALTER TABLE functionality from 3.53.0.
+* Do not allow `delete()` method to be called on a model instance.
+  `Model.delete()` is a classmethod for constructing a `DELETE` query, and
+  `model.delete_instance()` has always been the correct path for deleting a
+  model instance. This new check just ensures that a new user cannot
+  accidentally delete their whole table by using the class-version from an
+  instance. Fixes #2277.
+* Server-side cursors opened inside a transaction on psycopg3 are no longer
+  declared `WITH HOLD`. They stream and are scoped to the transaction, rather
+  than spooling their remaining rows server-side at commit.
+* `scalar()` applies a `LIMIT 1` via `first()`, rather than running the
+  query unbounded and reading the first value. The query itself is not mutated,
+  the limit is applied only on an internal copy, refs #3068.
+* Ensure `JSONField` works when proxy is already initialized. Thanks
+  @NotAFlightRisk, refs #3070.
+* `commit()` / `rollback()` on a closed db will raise rather than silently open
+  a new connection.
+
+[View commits](https://github.com/coleifer/peewee/compare/4.3.0...4.4.0)
+
+## 4.3.0
+
+Backwards-incompatible:
+
+* Specify `requires-python >= 3.8`. I've been putting off committing to
+  anything like this, since technically we still work on 3.7, but 3.8 is the
+  minimum we run on CI so it felt correct.
+* Replace `docid` implicit primary key on legacy `FTSModel` (FTS4) with
+  `rowid`, which is equivalent. Using `docid` presents no benefit and
+  switching to `rowid` makes operations more consistent. Users have a couple
+  options when updating:
+    * Explicitly add `docid = DocIDField()` to your FTSModel classes.
+    * Update your code, replacing `docid` with `rowid`. The underlying data
+      does not require a migration, as docid was just an alias for rowid.
+* When a RETURNING-clause insert of a single row inserts nothing, e.g. a
+  conflict was ignored, `execute()` returns `None` on every backend.
+
+Improvements:
+
+* Connection pools roll back transactions left open on check-in.
+* Pooled Postgres probes idle connections with `SELECT 1` and discards dead
+  ones, matching the MySQL pool's ping. Previously a connection terminated
+  server-side while parked in the pool was handed out and failed on first use.
+* `close_pool()` in pwasyncio no longer spins the event loop on Python
+  3.13+ attempting to reclaim connections in use, and pool creation is now
+  bounded by `acquire_timeout`. Connections terminated during shutdown are
+  detected as stale and discarded at the next checkout.
+* `JSONField` negative path indexes render as `$[last]` / `$[last-n]` on
+  MySQL/MariaDB. Previously the sqlite-only `$[#-n]` form was emitted, which
+  MariaDB evaluates to NULL (overwriting the column when used with `set()`)
+  and MySQL rejects as an invalid path.
+* `JSONField` mutators (`set()`, `insert()`, etc) store Python booleans as
+  json true/false instead of the driver's 0/1, so values written by `create()`
+  and by mutators compare consistently. Floats on MySQL/MariaDB likewise take
+  their json text form, as MariaDB reformats driver floats in a way that
+  breaks equality against the stored document.
+* Reflection/pwiz map MySQL JSON columns to the core `JSONField` instead of
+  emitting `from playhouse.mysql_ext import *` for a re-exported field.
+* `playhouse.pwasyncio` logs to the `peewee.pwasyncio` logger rather than
+  `playhouse.pwasyncio`.
+* Fix `dataset` freeze/thaw of NULL blob and datetime values. Empty CSV cells
+  now import as NULL for non-text fields.
+* Lateral joins honor a user-supplied `on=` predicate instead of silently
+  replacing it with `true`, and default to `ON true` when `on=` is omitted.
+* The SQLite FTS `content` option must be a Model or table-name string.
+  Passing a Field now raises `ImproperlyConfigured`: it generated DDL that
+  fts5 rejects outright and that fts4 silently truncated to the table name.
+* Fix `FTS5Model.VocabModel()`: term/col/offset were declared as virtual
+  fields and omitted from default SELECTs, the instance-type model had the
+  wrong column set, all three table-types shared one default table name, and
+  the generated class was cached with whatever database was bound at first
+  call. Vocab models are now built fresh per call with real fields, correct
+  columns and per-type default names.
+* Add `FTS5Model.web_query()`, which translates the query syntax users expect
+  from a search box (quoted phrases, AND/OR/NOT, `-exclusion`, `column:`
+  filters and parentheses) into an FTS5 query. Anything else is searched as
+  text, so `covid-19` or `c++` need no escaping, and the translation is always
+  a valid query. The parser lives in the new `playhouse.fts_parser` module.
+  Use it with search: `Doc.search(Doc.web_query(user_input))`.
+* Add `FTS5Model.delete_command()`, which removes a row using the fts5 `delete`
+  command. This is how rows are removed from external-content and contentless
+  tables, which need the originally-indexed values supplied back to them:
+  sqlite treats an omitted column as NULL, and values that do not match what
+  was indexed leave stale entries behind (undetectably so on a contentless
+  table). Peewee therefore requires a value for every indexed column; pass
+  `None` where NULL was indexed. The command exists only for those two
+  configurations - default-storage and `contentless_delete=1` tables reject
+  it and use ordinary `DELETE`.
+* Add support for cysqlite's sick table func decorator syntax.
+* Better behavior for INSERT when `as_rowcount()` is specified, along with
+  proper return of all parts of a composite PK instead of just the 1st column.
+* `last_insert_id()` is implemented once on `Database`, with backends
+  overriding `_last_insert_rowid()` where the driver differs. APSW and the
+  MariaDB connector inherit composite primary-key support as a result, having
+  previously returned only the first column.
+* Don't apply field kwargs to barefield instances w/reflection, #3064.
+
+[View commits](https://github.com/coleifer/peewee/compare/4.2.6...4.3.0)
+
+## 4.2.6
+
+* A missed outer join is now cached as an absent relation instead of being
+  written through the foreign-key descriptor. The fk id on the source
+  instance keeps the column's value (previously it was overwritten with
+  `None`), and accessing the attribute on a non-null fk returns `None`
+  instead of raising `DoesNotExist`.
+
+[View commits](https://github.com/coleifer/peewee/compare/4.2.5...4.2.6)
+
+## 4.2.5
+
+* Fix anonymous sub-select keeping a stale `id()`-based hash after `clone()`.
+
+[View commits](https://github.com/coleifer/peewee/compare/4.2.4...4.2.5)
+
+## 4.2.4
+
+* Fix derived table joined in an expression subquery losing its FROM alias.
+* Fix default `Model.select()` used as a FROM/JOIN source reduced to its pk.
+* Fix compound/subquery SELECT-list column emitting a phantom alias.
+* Fix `fn.EXISTS(compound)` double-parenthesizing.
+* Fix `x.in_(ValuesList(...))` dropping parens around `VALUES`.
+* Fix two-FK `.join(on=...)` mis-attaching rows when the fk is on the rhs.
+* Fix `ON CONFLICT ... DO NOTHING` dropping the target/where/constraint.
+
+[View commits](https://github.com/coleifer/peewee/compare/4.2.3...4.2.4)
+
+## 4.2.3
+
+* Fix a compound select (`UNION`/`INTERSECT`/`EXCEPT`) used as a correlated
+  subquery emitting a phantom alias for the correlated outer table in every
+  branch but the left-most, producing invalid SQL (e.g. `no such column:
+  t4.id`). The right-hand branch renders in a fresh alias scope that no longer
+  resolved the outer source's existing alias, it now inherits the enclosing
+  scope's aliases while still assigning fresh aliases to its own sources.
+* Fix full-text search `weights` passed as a `dict` being mis-applied to the
+  wrong columns. For FTS3/4 the implicit `docid` primary-key was included when
+  building the weight list, shifting every column by one (raising `IndexError`
+  with the Python ranking UDF, silently mis-scoring with the Cython one), for
+  FTS5, `UNINDEXED` columns were skipped even though `bm25()` weights are
+  positional across all columns. The list form of `weights` was unaffected.
+* Fix `.cte()` clearing the source query's CTE list in place: converting a query
+  that carried a `with_cte(...)` clause into a CTE stripped the clause from that
+  query, so reusing it afterward referenced an undeclared CTE. The query is now
+  cloned before its CTE list is reset.
+* Fix `Table.select()` with no arguments on a `Table` declared without columns
+  emitting an empty projection (`SELECT  FROM ...`) instead of `SELECT *`.
+* Fix `Table.insert(select_query)` with no `columns` raising `TypeError` instead
+  of rendering `INSERT INTO t SELECT ...`.
+* Fix the MySQL migrator dropping a foreign key's `ON DELETE`/`ON UPDATE` action
+  when `add_not_null()` or `rename_column()` rebuilds the constraint, silently
+  downgrading e.g. `CASCADE` to `RESTRICT`. The actions reported by
+  `get_foreign_keys()` are now carried through to the rebuilt constraint.
+* Fix the legacy `postgres_ext` JSON `contains`/`contained_by`/`concat` raising
+  `AttributeError`, and `remove()` silently rewriting the entire column, when
+  applied to a `.path()`-chained lookup (e.g. `Model.data['a'].path('b')`). All
+  four now resolve the root field and full path via `_resolve_root()`, matching
+  the sibling `set`/`replace`/`insert`/`append`/`update` mutators.
+* Correct the `postgres_ext.JSONField` docs: the `json`-column field does not
+  support the `jsonb`-based mutation/concatenation builders (they raise
+  `ProgrammingError`), so the misleading "Postgres casts implicitly" claim was
+  removed and new code is steered to the built-in `JSONField`.
+* Fix the SQLite migrator treating a bare table-level `UNIQUE (a, b)` constraint
+  as a column when rebuilding a table (`add_not_null`, `drop_column`, ...),
+  raising `no column named UNIQUE`; `unique` is now recognized as a constraint.
+* Fix the SQLite migrator's table rebuild corrupting the `CREATE TABLE` keywords
+  for a table whose name is a case-insensitive substring of them (e.g. `ab`,
+  `t`, `tab`) -- the table-name substitution is now anchored to the trailing
+  name token.
+
+[View commits](https://github.com/coleifer/peewee/compare/4.2.2...4.2.3)
+
+## 4.2.2
+
+* Change `Field.__hash__` again... fml. Use `(model_cls, field name)`.
+* Fix `Metadata.remove_ref()` removing the wrong foreign-key when a model
+  has multiple foreign-keys to the same target, as `list.remove()` matched
+  the first entry via the overloaded `Field.__eq__`.
+* Fix a scalar subquery nested inside a function, `Case` or `Cast` collapsing
+  to its alias in an `UPDATE ... SET` value and in `ON CONFLICT DO UPDATE`,
+  as `qualify_names()` wrapped the value at `SCOPE_COLUMN`.
+* Fix `namedtuples()` on a query-builder (`Table`) query raising `ValueError`
+  when a column name is not a valid identifier. The plain
+  `NamedTupleCursorWrapper` now passes `rename=True`, matching the model path.
+* Fix outer joins in a joined model graph not hydrating a missing related
+  object as `None`, so accessing the attribute raised `AttributeError`. The
+  outer-join test had regressed to `endswith('OUTER')` (never true). It now
+  also recognizes `FULL JOIN` and `LEFT JOIN LATERAL`.
+* Fix `ModelSelect.select_extend()` mutating its receiver's default-projection
+  flag, so a base `Model.select()` reused as a subquery stopped collapsing to
+  its primary key. It now flags the returned clone, matching `select()`.
+* Fix `distinct(True)` and `distinct(False)` not clearing a prior
+  `distinct(*columns)`, so the query kept rendering `DISTINCT ON (...)` instead
+  of a plain `DISTINCT` or no distinct at all.
+* Fix Postgres `get_indexes()` shredding an expression index whose key contains
+  a comma, e.g. `COALESCE(a, 0)` split into two bogus columns. It joined the
+  per-key definitions into a comma-delimited string and split on the comma. It
+  now reads the key array directly.
+* Fix an empty insert (`Model.insert()`, `insert({})`) emitting `DEFAULT VALUES`
+  and dropping python-side field defaults, inconsistent with a partial insert
+  which backfills them. A model with no python defaults still uses `DEFAULT
+  VALUES`.
+
+[View commits](https://github.com/coleifer/peewee/compare/4.2.1...4.2.2)
+
+## 4.2.1
+
+Can't ship a stub that's not complete. Missed moving server_side_cursor()
+helper into the core psycopg helper.
+
+[View commits](https://github.com/coleifer/peewee/compare/4.2.0...4.2.1)
+
+## 4.2.0
+
+* Add django-style filter lookups: `contains`, `startswith`, `endswith`,
+  `between`, `is_null`, `not_in` and `iregexp`.
+* Fix SQLite index value inlining to apply properly.
+* Fix `PostgresqlDatabase(isolation_level=...)` having no effect on
+  transactions. Previously only `atomic(isolation_level=...)` worked.
+* Fix `Ordering.collate()` dropping the `nulls=` ordering.
+* Fix double-escaping of backticks in MySQL `get_indexes()`.
+* Honor the `windows=` parameter of the `Select` constructor.
+* Remove vestigial Python 2 compat (`reraise()`, `__div__`, `__nonzero__`)
+  and assorted dead internal code.
+* Remove `TimestampField.local_to_utc()` and `TimestampField.utc_to_local()`.
+* `Select.columns()` no longer accepts and ignores keyword arguments.
+* Remove unused `Metadata.get_rel_for_model()`.
+* Fix `SelectBase.exists()` ignoring its `database` argument.
+* Fix `CursorWrapper` indexing: `cursor[n]` raised IndexError for uncached
+  rows and `cursor[0]` fetched the entire result set.
+* Fix `.namedtuples()` crashing on selected columns that are not valid
+  Python identifiers.
+* Preserve `materialized=` when compounding CTEs via `union()`/`union_all()`.
+* Fix `ManyToManyField` reads when the through-model foreign keys use the
+  `'!'` backref sentinel.
+* Fix connection pooling with the `mariadb` connector - pooled connections
+  were discarded on every checkout.
+* Fix `sqliteq` `stop()` to drain the write queue and return True.
+* Fix apsw aggregate registration binding every name to the last-registered
+  aggregate class.
+* Fix two `NameError`s in `cysqlite_ext`: `blob_open()` and `progress()`.
+* Fix pwiz emitting an invalid `attr=` keyword instead of
+  `on_delete`/`on_update` for reflected foreign keys.
+* Fix `dataset` infinite loop on self-referential foreign keys, crash on
+  headerless CSV import, `thaw()` validating against export rather than
+  import formats, and the importer mutating live model metadata.
+* Fix `model_to_dict` to honor `only=`/`exclude=` for many-to-many fields,
+  fix `resolve_multimodel_query` on queries with narrowed selections.
+* Fix `signals.Model.save(True)` reporting `created=False` when
+  `force_insert` is passed positionally.
+* Fix `CompressedField` crashing on `str` values.
+* Fix psycopg3 server-side cursors (missing `withhold`) and CockroachDB
+  `run_transaction` retry detection under psycopg3.
+* Async queries are now logged to the `peewee` logger.
+* Remove dead code and unused imports throughout `playhouse`, remove the
+  broken, unused `get_current_url`/`get_next_url` helpers from
+  `flask_utils`.
+* Fix `delete_instance(recursive=True)` failing to cascade to the children
+  of a model reachable through both nullable and non-nullable foreign-keys.
+* Fix subqueries losing their parentheses when used as a CASE value inside
+  a single-argument function call, e.g. `fn.SUM(Case(...))`.
+* Fix plain-`Table` inserts on returning-clause databases binding the
+  primary-key name as a parameter and returning None instead of the new id.
+* `CompositeKey` comparisons raise `ValueError` when the value's length does
+  not match the key, rather than silently matching on a prefix.
+* Async: connection-acquisition errors are translated to peewee exception
+  types, matching query execution.
+* Fix `FieldAlias.model` to reference the model alias rather than the aliased
+  model, alias-rooted join queries no longer construct and discard a spurious
+  instance of the aliased model for every result row.
+* Fix `playhouse.postgres_ext.JSONField` creating `jsonb` columns after the
+  core postgres backend began mapping the JSON field-type to JSONB, its DDL
+  is `json` again, and json-vs-jsonb function selection for chained lookups
+  now follows the field's declared datatype.
+* Unaliased expressions in join queries now hydrate using the same cleaned
+  attribute name as flat queries (e.g. `COUNT` rather than `COUNT(1`).
+* `Field.__hash__` is keyed on the model's schema and table-name rather than
+  its class name, so same-named model classes (factories, separate modules,
+  schema-per-tenant layouts) no longer collide in field-keyed registries such
+  as backrefs, redefining or re-importing a model in place still replaces
+  its entries.
+* Fix `UnboundLocalError` when joining from a model-less source to a model,
+  e.g. `join_from(cte, SomeModel, on=...)`, the joined instance is stored in
+  the source's row dict, keyed by the model name.
+* `BlobField`, `CompressedField` and the `sqlite_udf.gzip()` function encode
+  `str` values using utf-8 instead of `raw_unicode_escape`. Behavior change
+  for non-ASCII strings: characters
+  above the latin-1 range are no longer mangled into literal escape
+  sequences, but blobs written from non-ASCII strings by earlier versions
+  will not compare equal to newly-written ones.
+
+[View commits](https://github.com/coleifer/peewee/compare/4.1.2...4.2.0)
+
+## 4.1.2
+
+* Ensure quotes escaped in SQLite introspection methods, thanks @greymoth-jp
+  for reporting and the initial patch.
+* Allow TimestampField to accept an iso-formatted str.
+* Add key-existence predicates (`has_key`, `has_keys`, `has_any_keys`) to the
+  core `JSONField` on SQLite, implemented with `json_type()`.
+* Add containment predicates (`contains`, `contained_by`) to the core
+  `JSONField` on SQLite via a registered `_pw_json_contains` UDF that emulates
+  Postgres' `@>` semantics (structural, level-aligned). The core `JSONField`
+  now has full predicate parity across SQLite, Postgres, and MySQL/MariaDB.
+
+[View commits](https://github.com/coleifer/peewee/compare/4.1.1...4.1.2)
+
+## 4.1.1
+
+* New declarative API for pre-fetching related instances (`Load()`). See
+  [documentation](https://docs.peewee-orm.com/en/latest/peewee/relationships.html#avoiding-n-1-with-eager-loading).
+  This replaces `prefetch()`, is more flexible and also supports options for
+  applying a row limit to sub-results, and a strategy that materializes the ID
+  list (in addition to SELECT IN and JOIN strategies).
+* Add `MySQLJSONField` (`playhouse.mysql_ext`) with `contains_any()` for the
+  `JSON_OVERLAPS`/"match any" counterpart to `contains` for JSON arrays.
+* Do not traverse foreign-key fields where `lazy_load=False` when serializing
+  recursively with `model_to_dict()`, #3055.
+* Add vendored typeshed stub with improvements.
+
+[View commits](https://github.com/coleifer/peewee/compare/4.1.0...4.1.1)
+
+## 4.1.0
+
+* Unfortunately, the new JSONField did not play nice w/MySQL when query was
+  generated *before* a conn was opened. We were trying to do some introspection
+  on the server version, but I've decided instead to make `mariadb=` be a
+  database param, per @alisonatwork's suggestion, with the default being
+  "MySQL" flavored JSON. Refs #3053
+* `JSONField` containment (`contains`, `contained_by`) no longer wraps its
+  argument in `CAST` / `JSON_COMPACT` on MySQL/MariaDB, #3053.
+
+[View commits](https://github.com/coleifer/peewee/compare/4.0.9...4.1.0)
+
+## 4.0.9
+
+* Ensure new JSONField can be inherited, #3052
+
+[View commits](https://github.com/coleifer/peewee/compare/4.0.8...4.0.9)
+
+## 4.0.8
+
+* Add `BaseQuery.aexecute()` - an async twin of `execute()` available on all
+  query types, executing through the query's bound async database:
+  `await User.select().aexecute()`, `await user.tweets.aexecute()`. Returns
+  exactly what `execute()` returns, including result rows for DML with
+  `RETURNING`. Queries remain non-awaitable, this is an ordinary coroutine
+  method and the only async method on queries.
+* Add async model methods to `playhouse.pwasyncio` using "a"-prefixed coroutine
+  counterparts of the row-level `Model` methods (`acreate`, `aget`,
+  `aget_or_none`, `aget_by_id`, `aget_or_create`, `aset_by_id`,
+  `adelete_by_id`, `abulk_create`, `abulk_update`, `asave`,
+  `adelete_instance`), available via the new `AsyncModel` /
+  `AsyncModelMixin` classes. Each is a thin delegation through the greenlet
+  bridge, so behavior is identical to the synchronous implementation.
+  Note: the `Model` property of async databases now returns a base class
+  that includes these methods - relevant only if you introspect the base
+  class of `db.Model` subclasses.
+* Add `afetch()` for explicit, awaitable lazy foreign-key resolution:
+  `user = await tweet.afetch(Tweet.user)`. Already-loaded relations (via
+  join or prefetch) return immediately without a query.
+* Add `db.first(query, n=1)` async helper.
+* `MissingGreenletBridge` errors now include a hint describing the async
+  APIs to use.
+* The asyncio extension is no longer considered preliminary - the async
+  APIs documented in [the docs](https://docs.peewee-orm.com/en/latest/peewee/asyncio.html)
+  are stable. The asyncio stress test now also runs in CI.
+
+[View commits](https://github.com/coleifer/peewee/compare/4.0.7...4.0.8)
+
+## 4.0.7
+
+* Fixes for `playhouse.pwasyncio`: report correct UPDATE / DELETE rowcounts on
+  asyncpg, roll back open transactions when connections are returned to the
+  pool, raise instead of deadlocking when querying during `iterate()`, and
+  detect the MySQL / MariaDB server version.
+* Additional `playhouse.pwasyncio` fixes: a second `iterate()` on a busy
+  connection raises instead of deadlocking, asyncpg exceptions are translated
+  to peewee exception types, registered aggregates / collations / window
+  functions / extensions and `timeout` are applied to async SQLite
+  connections, `:memory:` databases use a single connection, `atomic()`
+  accepts transaction arguments (e.g. `lock_type`), postgres connection URLs
+  and `isolation_level` are supported, `%%` in raw SQL is unescaped, and
+  attempting a query outside the greenlet bridge no longer emits "never
+  awaited" warnings.
+* Fixes for `playhouse.pydantic_utils`: JSON fields validate as `Any` (now
+  including the sqlite_ext `JSONField`), foreign keys may be included /
+  excluded by field name or column name, server-side defaults like
+  `SQL('CURRENT_TIMESTAMP')` are no longer emitted as schema defaults, and
+  `relationships` keys are validated.
+* Add a new cross-backend `JSONField` to core that provides basic operations
+  and also more consistent behavior when reading data. By default the new core
+  JSONField treats extracted values as JSON, which is generally the correct
+  thing, but "text-mode" is available as a chained `.as_text()` method. See
+  [docs](https://docs.peewee-orm.com/en/latest/peewee/models.html#json-field).
+  May eventually replace the backend-specific implementations with subclasses
+  that inherit semantics of this new field.
+  Note: `playhouse.mysql_ext.JSONField` is now the core field. The old
+  `json_dumps` / `json_loads` arguments are renamed `dumps` / `loads`, the
+  `extract()` method is removed (use item-access or `path()`), and MySQL
+  tables are now created with `JSON` columns rather than `TEXT`.
+* Eliminate use of deprecated params when connecting to MySQL databases, thanks
+  to @abulgher, #3050.
+* Using `fromisoformat()` ended up causing previously-unconverted strings (Ymd)
+  to be converted in some cases, e.g. formatting a datetime as a str (#3051).
+  The change I made to address this is to make explicit casts on function calls
+  not attempt any heuristic python-value conversion. This makes it more natural
+  to call `fn.whatever().cast('text')` and you predictably get text out.
+
+[View commits](https://github.com/coleifer/peewee/compare/4.0.6...4.0.7)
+
+## 4.0.6
+
+* Add new methods to the postgres `BinaryJSONField`: helpers for in-place
+  modifications (`set`, `replace`, `insert`, `append`, `update`).
+* Also add json-path helpers to the postgres `BinaryJSONField` (`path_exists`,
+  `path_match`, `path_query`, `path_query_array`, `path_query_first`).
+* Quote path elements in SQLite's JSON field.
+* Better and faster parsing of formatted date/times. Use the stdlib
+  `fromisoformat` as a first attempt since it's faster and more robust.
+* Ensure `db.connection_context()` can be nested cleanly, #3046.
+* Fix potential deadlock in `pool.close_all` and `pool.manual_close`, #3047.
+* Restore whitespace stripping in `FixedCharField`, #3048.
+
+[View commits](https://github.com/coleifer/peewee/compare/4.0.5...4.0.6)
+
+## 4.0.5
+
+* Fix bug where `db_value()` may not get called in subclasses of Postgres
+  JSONField / BinaryJSONField, refs #3044.
+* Fix bug where indexes for table may be defined on multiple schema, #3043.
+* Always fall-through to base exception class if exception is not recognized in
+  DB drivers. This simplifies checking driver-specific subclasses of standard
+  DB-API exceptions.
+
+[View commits](https://github.com/coleifer/peewee/compare/4.0.4...4.0.5)
+
+## 4.0.4
+
+* Fix SQL generation for partial indexes with nulls (not) distinct clause.
+* Raise an `ImproperlyConfigured` if pg driver unavailable at model
+  definition-time when field db-hooks are used, rather than `AttributeError`.
+
+[View commits](https://github.com/coleifer/peewee/compare/4.0.3...4.0.4)
+
+## 4.0.3
+
+* Refactor test suite - this was a mechanical refactor, just moving things
+  around and trying to group things more clearly. Also added new tests covering
+  some gaps.
+* Expand multi-value types to include generator expressions, so you can write
+  stuff like `.in(a for a in iterable if cond)`.
+* Ensure quotes embedded in entity names are escaped.
+* Improved specification of `FOR UPDATE` clauses.
+* Fix for negative values in `paginate()` method.
+* Fix for newer MySQL server versions in feature detection code.
+* More robust handling of unusual aliases / invalid attr names in cursor
+  wrapper.
+* Better handling of duplicated column names in cursor wrapper implementations.
+* Improve performance of ModelCursorWrapper when reconstructing model instance
+  graphs after multi-table selects.
+* If only psycopg3 is installed, use it by default (#3036)
+
+[View commits](https://github.com/coleifer/peewee/compare/4.0.2...4.0.3)
+
+## 4.0.2
+
+* Remove all Python 2.x compatibility code.
+* Add streaming result cursors to pwasyncio module via `db.iterate(query)`.
+* Better serialization and deserialization of datetimes and binary data in the
+  DataSet module. Previously binary data was encoded as base64, going forward
+  hex is the new default. For base64 specify `base64_bytes=True`.
+* Improvements to Postgres `BinaryJSONField`, support atomic removal of
+  sub-elements, as well as alternate helper for extracting sub-elements and
+  querying array length.
+* [Pydantic integration](https://docs.peewee-orm.com/en/latest/peewee/orm_utils.html#module-playhouse.pydantic_utils)
+
+[View commits](https://github.com/coleifer/peewee/compare/4.0.1...4.0.2)
+
+## 4.0.1
+
+* Ensure `gr_context` is set on greenlet in `greenlet_spawn` so that
+  contextvars will be operable in sync handlers.
+* Removed `SqliteExtDatabase` (it basically served no purpose in 4.0). Use
+  `SqliteDatabase` instead.
+* Moved driver and extension-specific pooled implementations into the
+  corresponding extension module rather than putting all into `playhouse.pool`.
+* Restore custom `dumps` option for postgres JSON fields.
+* Major docs rewrite / reorganization.
+
+[View commits](https://github.com/coleifer/peewee/compare/4.0.0...4.0.1)
+
+## 4.0.0
+
+* Adds preliminary support for `asyncio` via a new playhouse extension. See
+  [the documentation](http://docs.peewee-orm.com/en/latest/peewee/asyncio.html)
+  for details.
+* `PostgresqlDatabase` can use `psycopg` (psycopg3) if it is installed. If both
+  psycopg2 and psycopg3 are installed, Peewee will prefer psycopg2, but this
+  can be controlled by specifying `prefer_psycopg3=True` in the constructor.
+  Same applies to `PostgresqlExtDatabase`.
+* `Psycopg3Database` class has been moved to `playhouse.postgres_ext` and is
+  now just a thin wrapper around `PostgresqlExtDatabase`.
+* Postgres JSON operations no longer dump and try to do minimal casts, instead
+  relying on the driver-provided `Json()` wrapper(s).
+* Adds new `ISODateTimeField` for Sqlite that encodes datetimes in ISO format
+  (more friendly when db is shared with other tools), and also properly reads
+  back UTC offset info.
+* Remove `playhouse.sqlite_ext.ClosureTable` implementation.
+* Add a `Model.dirty_field_names` attribute that is safe for membership
+  testing, since testing `x in dirty_fields` returns True if one or more field
+  exists due to operator overloads returning a truthy Expression object.
+  Refs #3028.
+* Removal of Cython `_sqlite_ext` extension. The C implementations of the FTS
+  rank functions are moved to `sqlite_udf`. Most of the remaining functionality
+  is moved to `playhouse.cysqlite_ext` which supports it natively.
+
+Migrating `CSqliteExtDatabase` usage:
+
+You can either use `sqlite_ext.SqliteExtDatabase` or try the new
+`cysqlite_ext.CySqliteDatabase` if you want all the old functionality and are
+willing to try a new driver.
+
+[View commits](https://github.com/coleifer/peewee/compare/3.19.0...4.0.0)
+
+## 3.19.0
+
+* Move to new build system using pyproject and github actions.
+* No longer build and ship the Sqlite C extensions by default. Users who prefer
+  to use those can install via the sdist `pip install peewee --no-binary :all:`.
+
+Rationale about the Sqlite C extensions -- I've started shipping pysqlite3 as a
+statically-linked, self-contained binary wheel. This means that when using
+Peewee with the statically-linked pysqlite3, you can end up in a funny
+situation where the peewee Sqlite extensions are linked against the system
+libsqlite3, and the pysqlite driver has it's own Sqlite embedded, which does
+not work.
+
+If you are using the system/standard-lib sqlite3 module then the extension
+works properly, because everything is talking to the same `libsqlite3`.
+
+Similarly if you built pysqlite3 to link against the system `libsqlite3`
+everything also works correctly, though this is not "wheel-friendly".
+
+So in order to use the C extensions, you can install Peewee from the sdist and
+do either of the following:
+
+```
+# Use system sqlite and standard-lib `sqlite3` module.
+$ pip install peewee --no-binary :all:
+
+# OR,
+# Use pysqlite3 linked against the system sqlite.
+$ pip install pysqlite3 peewee --no-binary :all:
+```
+
+I don't believe, besides myself, there were many people using these extensions
+so hopefully this change is not disruptive! Please let me hear about it if I'm
+mistaken.
+
+Other small changes:
+
+* When exporting / "freezing" binary data with the `playhouse.dataset` JSON
+  serializer, encode binary data as base64.
+
+## 3.18.3
+
+* Fix potential regex DoS vulnerability in FTS5 query validation code (#3005).
+
+[View commits](https://github.com/coleifer/peewee/compare/3.18.2...3.18.3)
+
+## 3.18.2
+
+Cython 3.1 removes some Python 2 stuff we referenced -- this resolves the
+issue. Couple other very minor fixes.
+
+[View commits](https://github.com/coleifer/peewee/compare/3.18.1...3.18.2)
+
+## 3.18.1
+
+@pypa is such a bunch of clowns. I swear.
+
+![](https://media.charlesleifer.com/blog/photos/p1746027512.1307786.gif)
+
+[View commits](https://github.com/coleifer/peewee/compare/3.18.0...3.18.1)
+
+## 3.18.0
+
+The behavior of `postgresql_ext.BinaryJSONField.contains()` has changed.
+Previously, passing a string to this method would perform a JSON key exists
+check (`?` operator) instead of JSON contains (`@>` operator). As of 3.18.0,
+this special-case has been **removed** and the `contains()` method always uses
+the JSONB contains operator (`@>`). For the **old** behavior of checking
+whether a key exists, use the `BinaryJSONField.has_key()` method. See #2984 for
+discussion.
+
+* Add options to URL-unquote user and password when using the `db_url` helpers,
+  see #2974 for discussion.
+* Support using `postgresql://` URLs when connecting to psycopg3.
+
+[View commits](https://github.com/coleifer/peewee/compare/3.17.9...3.18.0)
+
+## 3.17.9
+
+* Fix incorrect handling of fk constraint name in migrator.
+* Fix test-only issue that can occur in Python 3.14a4.
+
+[View commits](https://github.com/coleifer/peewee/compare/3.17.8...3.17.9)
+
+## 3.17.8
+
+* Fix regression in behavior of `delete_instance()` when traversing nullable
+  foreign-keys, #2952. Introduced in 3.17.6. **Recommended that you update**.
+* Fix bug where joins not cloned when going from join-less -> joined query,
+  refs #2941.
+
+## 3.17.7
+
+* Add db_url support for psycopg3 via `psycopg3://`.
+* Ensure double-quotes are escaped properly when introspecting constraints.
+* A few documentation-related fixes.
+
+[View commits](https://github.com/coleifer/peewee/compare/3.17.6...3.17.7)
+
+## 3.17.6
+
+* Fix bug in recursive `model.delete_instance()` when a table contains
+  foreign-keys at multiple depths of the graph, #2893.
+* Fix regression in pool behavior on systems where `time.time()` returns
+  identical values for two connections. This adds a no-op comparable sentinel
+  to the heap to prevent any recurrence of this problem, #2901.
+* Ensure that subqueries inside `CASE` statements generate correct SQL.
+* Fix regression that broke server-side cursors with Postgres (introduced in
+  3.16.0).
+* Fix to ensure compatibility with psycopg3 - the libpq TransactionStatus
+  constants are no longer available on the `Connection` instance.
+* Fix quoting issue in pwiz that could generate invalid python code for
+  double-quoted string literals used as column defaults.
+
+[View commits](https://github.com/coleifer/peewee/compare/3.17.5...3.17.6)
+
+## 3.17.5
+
+This release fixes a build system problem in Python 3.12, #2891.
+
+[View commits](https://github.com/coleifer/peewee/compare/3.17.4...3.17.5)
+
+## 3.17.4
+
+* Fix bug that could occur when using CASE inside a function, and one or more
+  of the CASE clauses consisted of a subquery. Refs #2873.
+  new fix in #2872 for regression in truthiness of cursor.
+* Fix bug in the conversion of TIMESTAMP type in Sqlite on Python 3.12+.
+* Fix for hybrid properties on subclasses when aliased (#2888).
+* Many fixes for SqliteQueueDatabase (#2874, #2876, #2877).
+
+[View commits](https://github.com/coleifer/peewee/compare/3.17.3...3.17.4)
+
+## 3.17.3
+
+* Better fix for #2871 (extraneous queries when coercing query to list), and
+
+[View commits](https://github.com/coleifer/peewee/compare/3.17.2...3.17.3)
+
+## 3.17.2
+
+* Full support for `psycopg3`.
+* Basic support for Sqlite `jsonb`.
+* Fix bug where calling `list(query)` resulted in extra queries, #2871
+
+[View commits](https://github.com/coleifer/peewee/compare/3.17.1...3.17.2)
+
+## 3.17.1
+
+* Add bitwise and other helper methods to `BigBitField`, #2802.
+* Add `add_column_default` and `drop_column_default` migrator methods for
+  specifying a server-side default value, #2803.
+* The new `star` attribute was causing issues for users who had a field named
+  star on their models. This attribute is now renamed to `__star__`. #2796.
+* Fix compatibility issues with 3.12 related to utcnow() deprecation.
+* Add stricter locking on connection pool to prevent race conditions.
+* Add adapters and converters to Sqlite to replace ones deprecated in 3.12.
+* Fix bug in `model_to_dict()` when only aliases are present.
+* Fix version check for Sqlite native drop column support.
+* Do not specify a `reconnect=` argument to `ping()` if using MySQL 8.x.
+
+[View commits](https://github.com/coleifer/peewee/compare/3.17.0...3.17.1)
+
+## 3.17.0
+
+* Only roll-back in the outermost `@db.transaction` decorator/ctx manager if
+  an unhandled exception occurs. Previously, an unhandled exception that
+  occurred in a nested `transaction` context would trigger a rollback. The use
+  of nested `transaction` has long been discouraged in the documentation: the
+  recommendation is to always use `db.atomic`, which will use savepoints to
+  properly handle nested blocks. However, the new behavior should make it
+  easier to reason about transaction boundaries - see #2767 for discussion.
+* Cover transaction `BEGIN` in the reconnect-mixin. Given that no transaction
+  has been started, reconnecting when beginning a new transaction ensures that
+  a reconnect will occur if it is safe to do so.
+* Add support for setting `isolation_level` in `db.atomic()` and
+  `db.transaction()` when using Postgres and MySQL/MariaDB, which will apply to
+  the wrapped transaction. Note: Sqlite has supported a similar `lock_type`
+  parameter for some time.
+* Add support for the Sqlite `SQLITE_DETERMINISTIC` function flag. This allows
+  user-defined Sqlite functions to be used in indexes and may be used by the
+  query planner.
+* Fix unreported bug in dataset import when inferred field name differs from
+  column name.
+
+[View commits](https://github.com/coleifer/peewee/compare/3.16.3...3.17.0)
+
+## 3.16.3
+
+* Support for Cython 3.0.
+* Add flag to `ManyToManyField` to prevent setting/getting values on unsaved
+  instances. This is worthwhile, since reading or writing a many-to-many has no
+  meaning when the instance is unsaved.
+* Adds a `star()` helper to `Source` base-class for selecting all columns.
+* Fix missing `binary` types for mysql-connector and mariadb-connector.
+* Add `extract()` method to MySQL `JSONField` for extracting a jsonpath.
+
+[View commits](https://github.com/coleifer/peewee/compare/3.16.2...3.16.3)
+
+## 3.16.2
+
+Fixes a longstanding issue with thread-safety of various decorators, including
+`atomic()`, `transaction()`, `savepoint()`. The context-managers are
+unaffected. See #2709 for details.
+
+[View commits](https://github.com/coleifer/peewee/compare/3.16.1...3.16.2)
+
+## 3.16.1
+
+* Add changes required for building against Cython 3.0 and set Cython
+  language-level to 3.
+* Ensure indexes aren't added to unindexed fields during introspection, #2691.
+* Ensure we don't redundantly select same PK in prefetch when using
+  PREFETCH_TYPE.JOIN.
+* In Sqlite migrator, use Sqlite's builtin DROP and RENAME column facilities
+  when possible. This can be overridden by passing `legacy=True` flag.
+
+[View commits](https://github.com/coleifer/peewee/compare/3.16.0...3.16.1)
+
+## 3.16.0
+
+This release contains backwards-incompatible changes in the way Peewee
+initializes connections to the underlying database driver. Previously, peewee
+implemented autocommit semantics *on-top* of the existing DB-API transactional
+workflow. Going forward, Peewee instead places the DB-API driver into
+autocommit mode directly.
+
+Why this change?
+
+Previously, Peewee emulated autocommit behavior for top-level queries issued
+outside of a transaction. This necessitated a number of checks which had to be
+performed each time a query was executed, so as to ensure that we didn't end up
+with uncommitted writes or, conversely, idle read transactions. By running the
+underlying driver in autocommit mode, we can eliminate all these checks, since
+we are already managing transactions ourselves.
+
+Behaviorally, there should be no change -- Peewee will still treat top-level
+queries outside of transactions as being autocommitted, while queries inside of
+`atomic()` / `with db:` blocks are implicitly committed at the end of the
+block, or rolled-back if an exception occurs.
+
+**How might this affect me?**
+
+* If you are using the underlying database connection or cursors, e.g. via
+  `Database.connection()` or `Database.cursor()`, your queries will now be
+  executed in autocommit mode.
+* The `commit=` argument is deprecated for the `cursor()`, `execute()` and
+  `execute_sql()` methods.
+* If you have a custom `Database` implementation (whether for a database that
+  is not officially supported, or for the purpose of overriding default
+  behaviors), you will want to ensure that your connections are opened in
+  autocommit mode.
+
+Other changes:
+
+* Some fixes to help with packaging in Python 3.11.
+* MySQL `get_columns()` implementation now returns columns in their declared
+  order.
+
+[View commits](https://github.com/coleifer/peewee/compare/3.15.4...3.16.0)
+
+## 3.15.4
+
+* Raise an exception in `ReconnectMixin` if connection is lost while inside a
+  transaction (if the transaction was interrupted presumably some changes were
+  lost and explicit intervention is needed).
+* Add `db.Model` property to reduce boilerplate.
+* Add support for running `prefetch()` queries with joins instead of subqueries
+  (this helps overcome a MySQL limitation about applying LIMITs to a subquery).
+* Add SQL `AVG` to whitelist to avoid coercing by default.
+* Allow arbitrary keywords in metaclass constructor, #2627
+* Add a `pyproject.toml` to silence warnings from newer pips when `wheel`
+  package is not available.
+
+This release has a small helper for reducing boilerplate in some cases by
+exposing a base model class as an attribute of the database instance.
+
+```python
+# old:
+db = SqliteDatabase('...')
+
+class BaseModel(Model):
+    class Meta:
+        database = db
+
+class MyModel(BaseModel):
+    pass
+
+# new:
+db = SqliteDatabase('...')
+
+class MyModel(db.Model):
+    pass
+```
+
+[View commits](https://github.com/coleifer/peewee/compare/3.15.3...3.15.4)
+
+## 3.15.3
+
+* Add `scalars()` query method (complements `scalar()`), roughly equivalent to
+  writing `[t[0] for t in query.tuples()]`.
+* Small doc improvements
+* Fix and remove some flaky test assertions with Sqlite INSERT + RETURNING.
+* Fix innocuous failing Sqlite test on big-endian machines.
+
+[View commits](https://github.com/coleifer/peewee/compare/3.15.2...3.15.3)
+
+## 3.15.2
+
+* Fix bug where field-specific conversions were being applied to the pattern
+  used for LIKE / ILIKE operations. Refs #2609
+* Fix possible infinite loop when accidentally invoking the `__iter__` method
+  on certain `Column` subclasses. Refs #2606
+* Add new helper for specifying which Model a particular selected column-like
+  should be bound to, in queries with joins that select from multiple sources.
+
+[View commits](https://github.com/coleifer/peewee/compare/3.15.1...3.15.2)
+
+## 3.15.1
+
+* Fix issue introduced in Sqlite 3.39.0 regarding the propagation of column
+  subtypes in subqueries.
+* Fix bug where cockroachdb server version was not set when beginning a
+  transaction on an unopened database.
+
+[View commits](https://github.com/coleifer/peewee/compare/3.15.0...3.15.1)
+
+## 3.15.0
+
 Rollback behavior change in commit ab43376697 (GH #2026). Peewee will no longer
 automatically return the cursor `rowcount` for certain bulk-inserts.  This
-should only affect users of MySQL and Sqlite who relied on a bulk INSERT
+should mainly affect users of MySQL and Sqlite who relied on a bulk INSERT
 returning the `rowcount` (as opposed to the cursor's `lastrowid`). The
 `rowcount` behavior is still available chaining the ``as_rowcount()`` method:
 
@@ -31,18 +1024,43 @@ last_id = query.execute()
 rows_inserted = query.as_rowcount().execute()
 ```
 
+Additionally, in previous versions specifying an empty `.returning()` with
+Postgres would cause the rowcount to be returned. For Postgres users who wish
+to receive the rowcount:
+
+```python
+# NOTE: this change only affects Postgresql.
+db = PostgresqlDatabase(...)
+
+# Previously, an empty returning() would return the rowcount.
+query = User.insert_many(...)  # Bulk insert.
+query = User.insert_from(...)  # Bulk insert (INSERT INTO .. SELECT FROM).
+
+# Old behavior:
+# rows_inserted = query.returning().execute()
+
+# To get the rows inserted in 3.15 and newer:
+rows_inserted = query.as_rowcount().execute()
+```
+
+This release contains a fix for a long-standing request to allow data-modifying
+queries to support CTEs. CTEs are now supported for use with INSERT, DELETE and
+UPDATE queries - see #2152.
+
 Additionally, this release adds better support for using the new `RETURNING`
-syntax with Sqlite automatically. Specify `returing_clause=True` when
+syntax with Sqlite automatically. Specify `returning_clause=True` when
 initializing your `SqliteDatabase` and all bulk inserts will automatically
 specify a `RETURNING` clause, returning the newly-inserted primary keys. This
 functionality requires Sqlite 3.35 or newer.
+
+Smaller changes:
 
 * Add `shortcuts.insert_where()` helper for generating conditional INSERT with
   a bit less boilerplate.
 * Fix bug in `test_utils.count_queres()` which could erroneously include pool
   events such as connect/disconnect, etc.
 
-[View commits](https://github.com/coleifer/peewee/compare/3.14.10...master)
+[View commits](https://github.com/coleifer/peewee/compare/3.14.10...3.15.0)
 
 ## 3.14.10
 

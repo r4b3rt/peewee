@@ -1,7 +1,7 @@
 from peewee import *
 from playhouse import signals
 
-from .base import get_in_memory_db
+from .base import IS_MYSQL
 from .base import ModelTestCase
 
 
@@ -18,7 +18,6 @@ class SubB(B): pass
 
 
 class TestSignals(ModelTestCase):
-    database = get_in_memory_db()
     requires = [A, B, SubB]
 
     def tearDown(self):
@@ -39,7 +38,8 @@ class TestSignals(ModelTestCase):
         self.assertEqual(a.save(), 1)
         self.assertEqual(state, [(A, a, None, True)])
 
-        self.assertEqual(a.save(), 1)
+        # MySQL reports changed rows, so a save that changes nothing is 0.
+        self.assertEqual(a.save(), 0 if IS_MYSQL else 1)
         self.assertTrue(a.id is not None)
         self.assertEqual(len(state), 2)
         self.assertEqual(state[-1], (A, a, a.id, False))
@@ -58,6 +58,16 @@ class TestSignals(ModelTestCase):
         a.save()
         self.assertEqual(len(state), 2)
         self.assertEqual(state[-1], (A, a, a.id, False))
+
+    def test_save_positional_force_insert(self):
+        state = []
+        @signals.post_save()
+        def post_save(sender, instance, created):
+            state.append(created)
+
+        a = A(id=10, a='x')
+        a.save(True)
+        self.assertEqual(state, [True])
 
     def test_pre_delete(self):
         state = []
@@ -157,6 +167,44 @@ class TestSignals(ModelTestCase):
         b = SubB.create()
         assert b in state
 
+    def test_disconnect_issue_2687(self):
+        state = []
+
+        # Same sender.
+        @signals.post_save(sender=A)
+        def sig1(sender, instance, created):
+            state.append((1, instance.a))
+
+        @signals.post_save(sender=A)
+        def sig2(sender, instance, created):
+            state.append((2, instance.a))
+
+        A.create(a='a1')
+        self.assertEqual(state, [(1, 'a1'), (2, 'a1')])
+        signals.post_save.disconnect(name='sig1', sender=A)
+
+        A.create(a='a2')
+        self.assertEqual(state, [(1, 'a1'), (2, 'a1'), (2, 'a2')])
+        signals.post_save.disconnect(name='sig2', sender=A)
+
+        A.create(a='a3')
+        self.assertEqual(state, [(1, 'a1'), (2, 'a1'), (2, 'a2')])
+
+        signals.post_save(name='s1')(sig1)
+        signals.post_save(name='s2', sender=A)(sig2)
+        state = state[:0]  # Clear state, 2.7 compat.
+
+        A.create(a='a4')
+        self.assertEqual(state, [(1, 'a4'), (2, 'a4')])
+        signals.post_save.disconnect(name='s1')
+
+        A.create(a='a5')
+        self.assertEqual(state, [(1, 'a4'), (2, 'a4'), (2, 'a5')])
+        signals.post_save.disconnect(name='s2', sender=A)
+
+        A.create(a='a6')
+        self.assertEqual(state, [(1, 'a4'), (2, 'a4'), (2, 'a5')])
+
 
 class NoPK(BaseSignalModel):
     val = IntegerField(index=True)
@@ -165,7 +213,6 @@ class NoPK(BaseSignalModel):
 
 
 class TestSaveNoPrimaryKey(ModelTestCase):
-    database = get_in_memory_db()
     requires = [NoPK]
 
     def test_save_no_pk(self):

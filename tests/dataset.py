@@ -3,25 +3,20 @@ import datetime
 import json
 import operator
 import os
-import sys
 import tempfile
-try:
-    from StringIO import StringIO
-except ImportError:
-    from io import StringIO
+from io import StringIO
 
 from peewee import *
 from playhouse.dataset import DataSet
-from playhouse.dataset import Table
 
-from .base import IS_SQLITE_OLD
 from .base import ModelTestCase
 from .base import TestModel
-from .base import db_loader
+from .base import get_sqlite_db
+from .base import requires_models
 from .base import skip_if
 
 
-db = db_loader('sqlite')
+db = get_sqlite_db()
 
 
 class User(TestModel):
@@ -32,10 +27,15 @@ class Note(TestModel):
     content = TextField()
     timestamp = DateTimeField()
     status = IntegerField(default=1)
+    data = BlobField()
 
 class Category(TestModel):
     name = TextField()
     parent = ForeignKeyField('self', null=True)
+
+class Bin(TestModel):
+    data = BlobField()
+    ts = DateTimeField()
 
 
 class TestDataSet(ModelTestCase):
@@ -71,7 +71,6 @@ class TestDataSet(ModelTestCase):
         users.insert(username='charlie')
         self.assertEqual(list(users), [{'id': 1, 'username': 'charlie'}])
 
-    @skip_if(IS_SQLITE_OLD)
     def test_with_views(self):
         self.dataset.query('CREATE VIEW notes_public AS '
                            'SELECT content, timestamp FROM note '
@@ -88,7 +87,8 @@ class TestDataSet(ModelTestCase):
             notes = self.dataset['note']
             for i, (ct, st) in enumerate([('n1', 1), ('n2', 2), ('n3', 1)]):
                 notes.insert(content=ct, status=st, user_id='charlie',
-                             timestamp=datetime.datetime(2022, 1, 1 + i))
+                             timestamp=datetime.datetime(2022, 1, 1 + i),
+                             data=b'')
 
             self.assertFalse('notes_public' in self.dataset)
 
@@ -129,6 +129,21 @@ class TestDataSet(ModelTestCase):
         self.assertEqual(list(users), [
             {'id': 1, 'username': 'charlie', 'color': None, 'kind': 'person'},
             {'id': 2, 'username': 'zaizee', 'color': None, 'kind': 'cat'}])
+
+    def test_model_kwargs_preserved(self):
+        dataset = DataSet('sqlite:///:memory:', bare_fields=True)
+        users = dataset['users']
+        users.insert(username='charlie')
+
+        def assertBare():
+            fields = users.model_class._meta.sorted_fields
+            self.assertTrue(all(type(f) is BareField for f in fields))
+
+        # Adding a column alters the table and refreshes the model cache.
+        users.insert(username='huey', color='white')
+        assertBare()
+        dataset.update_cache()
+        assertBare()
 
     def create_users(self, n=2):
         user = self.dataset['user']
@@ -179,8 +194,8 @@ class TestDataSet(ModelTestCase):
 
         note = self.dataset['note']
         columns = sorted(note.columns)
-        self.assertEqual(columns, ['content', 'id', 'status', 'timestamp',
-                                   'user_id'])
+        self.assertEqual(columns, ['content', 'data', 'id', 'status',
+                                   'timestamp', 'user_id'])
 
         category = self.dataset['category']
         columns = sorted(category.columns)
@@ -321,17 +336,20 @@ class TestDataSet(ModelTestCase):
                 content='note %s' % i,
                 timestamp=datetime.date(2014, 1, i),
                 status=i,
-                user_id='charlie')
+                user_id='charlie',
+                data=b'')
 
         notes = sorted(note.all(), key=operator.itemgetter('id'))
         self.assertEqual(notes[0], {
             'content': 'note 1',
+            'data': b'',
             'id': 1,
             'status': 1,
             'timestamp': datetime.datetime(2014, 1, 1),
             'user_id': 'charlie'})
         self.assertEqual(notes[-1], {
             'content': 'note 3',
+            'data': b'',
             'id': 3,
             'status': 3,
             'timestamp': datetime.datetime(2014, 1, 3),
@@ -402,7 +420,34 @@ class TestDataSet(ModelTestCase):
             'charlie',
             'huey'])
 
-    @skip_if(sys.version_info[0] < 3, 'requires python 3.x')
+    def test_freeze_thaw_nulls(self):
+        self.dataset._database.execute_sql(
+            'create table nt (id integer primary key, ts datetime, '
+            'data blob, num integer, label text)')
+        try:
+            self.dataset.update_cache('nt')
+            nt = self.dataset['nt']
+            variants = (('json', {}),
+                        ('json', {'iso8601_datetimes': True}),
+                        ('json', {'base64_bytes': True}),
+                        ('csv', {}),
+                        ('csv', {'iso8601_datetimes': True}))
+            for fmt, kwargs in variants:
+                nt.insert(label='x')
+                buf = StringIO()
+                self.dataset.freeze(nt.all(), fmt, file_obj=buf, **kwargs)
+                nt.delete()
+                buf.seek(0)
+                n = nt.thaw(format=fmt, file_obj=buf, **kwargs)
+                self.assertEqual(n, 1)
+                row = list(nt.all())[0]
+                self.assertEqual(
+                    (row['ts'], row['data'], row['num'], row['label']),
+                    (None, None, None, 'x'), (fmt, kwargs))
+                nt.delete()
+        finally:
+            self.dataset._database.execute_sql('drop table nt')
+
     def test_freeze_thaw_csv_utf8(self):
         self._test_freeze_thaw_utf8('csv')
 
@@ -435,7 +480,7 @@ class TestDataSet(ModelTestCase):
         note = self.dataset['note']
         note_ts = datetime.datetime(2017, 1, 2, 3, 4, 5)
         note.insert(content='foo', timestamp=note_ts, user_id='charlie',
-                    status=2)
+                    status=2, data=b'\xff\x00\xcc')
 
         buf = StringIO()
         self.dataset.freeze(note.all(), 'json', file_obj=buf)
@@ -444,7 +489,8 @@ class TestDataSet(ModelTestCase):
             'user_id': 'charlie',
             'content': 'foo',
             'status': 2,
-            'timestamp': '2017-01-02 03:04:05'}])
+            'timestamp': '2017-01-02 03:04:05',
+            'data': 'ff00cc'}])
 
         note.delete(id=1)
         self.assertEqual(list(note.all()), [])
@@ -456,13 +502,108 @@ class TestDataSet(ModelTestCase):
             'user_id': 'charlie',
             'content': 'foo',
             'status': 2,
-            'timestamp': note_ts}])
+            'timestamp': note_ts,
+            'data': b'\xff\x00\xcc'}])
+
+    @requires_models(Bin)
+    def test_freeze_thaw_datatypes_json(self):
+        Bin = self.dataset['bin']
+        ts = datetime.datetime(2026, 1, 2, 3, 4, 5,
+                               tzinfo=datetime.timezone.utc)
+
+        Bin.insert(data=b'\xff\x00\xcc', ts=ts)
+
+        buf = StringIO()
+        self.dataset.freeze(Bin.all(), 'json', file_obj=buf)
+        self.assertEqual(json.loads(buf.getvalue()), [{
+            'id': 1,
+            'data': 'ff00cc',
+            'ts': '2026-01-02 03:04:05+00:00'}])
+
+        Bin.delete(id=1)
+        buf.seek(0)
+        Bin.thaw(format='json', file_obj=buf)
+
+        self.assertEqual(list(Bin.all()), [{
+            'id': 1,
+            'data': b'\xff\x00\xcc',
+            'ts': ts}])
+
+        buf = StringIO()
+        self.dataset.freeze(Bin.all(), 'json', file_obj=buf,
+                            iso8601_datetimes=True, base64_bytes=True)
+        self.assertEqual(json.loads(buf.getvalue()), [{
+            'id': 1,
+            'data': '_wDM',
+            'ts': '2026-01-02T03:04:05+00:00'}])
+
+        Bin.delete(id=1)
+        buf.seek(0)
+        Bin.thaw(format='json', file_obj=buf, iso8601_datetimes=True,
+                 base64_bytes=True)
+
+        self.assertEqual(list(Bin.all()), [{
+            'id': 1,
+            'data': b'\xff\x00\xcc',
+            'ts': ts}])
+
+    @requires_models(Bin)
+    def test_freeze_thaw_datatypes_csv(self):
+        Bin = self.dataset['bin']
+        ts = datetime.datetime(2026, 1, 2, 3, 4, 5,
+                               tzinfo=datetime.timezone.utc)
+
+        Bin.insert(data=b'\xff\x00\xcc', ts=ts)
+
+        buf = StringIO()
+        self.dataset.freeze(Bin.all(), 'csv', file_obj=buf)
+        self.assertEqual(buf.getvalue().splitlines(), [
+            'id,data,ts',
+            '1,ff00cc,2026-01-02 03:04:05+00:00'])
+
+        Bin.delete(id=1)
+        buf.seek(0)
+        Bin.thaw(format='csv', file_obj=buf)
+
+        self.assertEqual(list(Bin.all()), [{
+            'id': 1,
+            'data': b'\xff\x00\xcc',
+            'ts': ts}])
+
+        buf = StringIO()
+        self.dataset.freeze(Bin.all(), 'csv', file_obj=buf,
+                            iso8601_datetimes=True, base64_bytes=True)
+        self.assertEqual(buf.getvalue().splitlines(), [
+            'id,data,ts',
+            '1,_wDM,2026-01-02T03:04:05+00:00'])
+
+        Bin.delete(id=1)
+        buf.seek(0)
+        Bin.thaw(format='csv', file_obj=buf, iso8601_datetimes=True,
+                 base64_bytes=True)
+
+        self.assertEqual(list(Bin.all()), [{
+            'id': 1,
+            'data': b'\xff\x00\xcc',
+            'ts': ts}])
 
     def test_table_column_creation(self):
         table = self.dataset['people']
         table.insert(name='charlie')
         self.assertEqual(table.columns, ['id', 'name'])
         self.assertEqual(list(table.all()), [{'id': 1, 'name': 'charlie'}])
+
+    def test_table_column_creation_field_col(self):
+        table = self.dataset['people']
+        table.insert(**{'First Name': 'charlie'})
+        self.assertEqual(table.columns, ['id', 'First_Name'])
+        self.assertEqual(list(table.all()), [{'id': 1, 'First_Name': 'charlie'}])
+
+        table.insert(**{'First Name': 'huey'})
+        self.assertEqual(table.columns, ['id', 'First_Name'])
+        self.assertEqual(list(table.all().order_by(table.model_class.id)), [
+            {'id': 1, 'First_Name': 'charlie'},
+            {'id': 2, 'First_Name': 'huey'}])
 
     def test_import_json(self):
         table = self.dataset['people']
@@ -512,6 +653,26 @@ class TestDataSet(ModelTestCase):
             {'id': 3, 'name': 'mickey', 'foo': 2, 'bar': None},
             {'id': 4, 'name': None, 'foo': None, 'bar': None},
         ])
+
+    def test_import_csv_no_header(self):
+        table = self.dataset['people']
+        table.insert(name='charlie')
+        buf = StringIO()
+        writer = csv.writer(buf)
+        writer.writerow(['10', 'nuggie'])
+        buf.seek(0)
+        count = self.dataset.thaw('people', 'csv', file_obj=buf, header=False)
+        self.assertEqual(count, 1)
+        row, = [r for r in self.dataset['people'].all() if r['id'] == 10]
+        self.assertEqual(row['name'], 'nuggie')
+
+    def test_self_referential_fk(self):
+        self.dataset._database.execute_sql(
+            'CREATE TABLE selfref ('
+            'id INTEGER PRIMARY KEY, '
+            'parent_id INTEGER REFERENCES selfref (id))')
+        table = self.dataset['selfref']
+        self.assertTrue('parent_id' in table.columns)
 
     def test_import_csv(self):
         table = self.dataset['people']

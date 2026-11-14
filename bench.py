@@ -4,6 +4,10 @@ from peewee import *
 db = SqliteDatabase(':memory:')
 #db = PostgresqlDatabase('peewee_test', host='127.0.0.1', port=26257, user='root')
 #db = PostgresqlDatabase('peewee_test', host='127.0.0.1', user='postgres')
+#from playhouse.cysqlite_ext import CySqliteDatabase
+#db = CySqliteDatabase(':memory:')
+#from playhouse.apsw_ext import APSWDatabase
+#db = APSWDatabase(':memory:')
 
 class Base(Model):
     class Meta:
@@ -26,11 +30,11 @@ def timed(fn):
     @functools.wraps(fn)
     def inner(*args, **kwargs):
         times = []
-        N = 10
+        N = 20
         for i in range(N):
-            start = time.time()
+            start = time.perf_counter()
             fn(i, *args, **kwargs)
-            times.append(time.time() - start)
+            times.append(time.perf_counter() - start)
         print('%0.3f ... %s' % (round(sum(times) / N, 3), fn.__name__))
     return inner
 
@@ -105,8 +109,30 @@ def select_related_dicts(i):
         pass
 
 @timed
+def select_related_objects(i):
+    query = Item.select(Item, Collection).join(Collection).objects()
+    for item in query:
+        pass
+
+@timed
 def select_prefetch(i):
-    query = prefetch(Collection.select(), Item)
+    query = Collection.select().with_related(Load(Collection.items))
+    for c in query:
+        for i in c.items:
+            pass
+
+@timed
+def select_prefetch_join(i):
+    query = Collection.select().with_related(
+        Load(Collection.items, strategy=PREFETCH_TYPE.JOIN))
+    for c in query:
+        for i in c.items:
+            pass
+
+@timed
+def select_prefetch_materialize(i):
+    query = Collection.select().with_related(
+        Load(Collection.items, strategy=PREFETCH_TYPE.MATERIALIZE))
     for c in query:
         for i in c.items:
             pass
@@ -118,17 +144,20 @@ if __name__ == '__main__':
     insert_related()
     Register.delete().execute()
     batch_insert()
-    assert Register.select().count() == 10000
+    assert Register.select().count() == 20000
     Register.delete().execute()
     bulk_insert()
-    assert Register.select().count() == 10000
+    assert Register.select().count() == 20000
     Register.delete().execute()
     bulk_create()
-    assert Register.select().count() == 10000
+    assert Register.select().count() == 20000
     select()
     select_related()
     select_related_left()
+    select_related_objects()
     select_related_dicts()
     select_related_dbapi_raw()
     select_prefetch()
+    select_prefetch_join()
+    select_prefetch_materialize()
     db.drop_tables([Register, Collection, Item])

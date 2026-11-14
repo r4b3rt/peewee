@@ -1,5 +1,4 @@
 import datetime
-import os
 import re
 import warnings
 
@@ -7,11 +6,13 @@ from peewee import *
 from playhouse.reflection import *
 
 from .base import IS_CRDB
-from .base import IS_SQLITE_OLD
+from .base import IS_CYSQLITE
+from .base import IS_MYSQL
+from .base import IS_ORACLE_MYSQL
+from .base import IS_SQLITE
 from .base import ModelTestCase
 from .base import TestModel
-from .base import db
-from .base import requires_models
+from .base import requires_postgresql
 from .base import requires_sqlite
 from .base import skip_if
 from .base_models import Tweet
@@ -78,6 +79,13 @@ class BaseReflectionTestCase(ModelTestCase):
 class TestReflection(BaseReflectionTestCase):
     requires = [ColTypes, Nullable, RelModel, FKPK, Underscores, Category,
                 Nugget]
+
+    def test_column_map_not_shared_with_class(self):
+        metadata = self.introspector.metadata
+        self.assertIsNot(metadata.column_map, type(metadata).column_map)
+        metadata.column_map['__fake__'] = TextField
+        self.assertNotIn('__fake__', type(metadata).column_map)
+        del metadata.column_map['__fake__']
 
     def test_generate_models(self):
         models = self.introspector.generate_models()
@@ -175,6 +183,20 @@ class TestReflection(BaseReflectionTestCase):
             self.assertEqual(match.groups(), (
                 'col_types_id', 'coltypes', 'f11',
             ))
+
+    @skip_if(not IS_ORACLE_MYSQL, 'requires mysql (mariadb reports longtext)')
+    def test_mysql_json_maps_to_core_field(self):
+        self.database.execute_sql('drop table if exists rj')
+        self.database.execute_sql(
+            'create table rj (id integer not null primary key '
+            'auto_increment, data json)')
+        try:
+            models = self.introspector.generate_models(table_names=['rj'])
+            field = models['rj']._meta.fields['data']
+            self.assertTrue(isinstance(field, JSONField))
+            self.assertFalse(self.introspector.metadata.requires_extension)
+        finally:
+            self.database.execute_sql('drop table rj')
 
     def test_make_column_name(self):
         # Tests for is_foreign_key=False.
@@ -379,6 +401,23 @@ class TestReflection(BaseReflectionTestCase):
         category = nugget['category']
         self.assertEqual(category.name, 'category')
 
+    def test_fk_on_delete_update(self):
+        self.database.execute_sql(
+            'CREATE TABLE odu ('
+            'id INTEGER PRIMARY KEY, '
+            'rel_model_id INTEGER, '
+            'FOREIGN KEY (rel_model_id) REFERENCES rel_model (id) '
+            'ON DELETE CASCADE ON UPDATE SET NULL)')
+        try:
+            (columns, primary_keys, foreign_keys, model_names,
+             indexes) = self.introspector.introspect()
+            params = columns['odu']['rel_model_id'].get_field_parameters()
+            self.assertEqual(params.get('on_delete'), "'CASCADE'")
+            self.assertEqual(params.get('on_update'), "'SET NULL'")
+            self.assertNotIn('attr', params)
+        finally:
+            self.database.execute_sql('DROP TABLE odu')
+
     def test_get_field(self):
         (columns,
          primary_keys,
@@ -391,7 +430,7 @@ class TestReflection(BaseReflectionTestCase):
                 ('f1', ('f1 = BigIntegerField(index=True)',
                         'f1 = IntegerField(index=True)')),
                 ('f2', ('f2 = BlobField()', 'f2 = TextField()')),
-                ('f4', 'f4 = CharField()'),
+                ('f4', 'f4 = CharField(max_length=50)'),
                 ('f5', 'f5 = DateField()'),
                 ('f6', 'f6 = DateTimeField()'),
                 ('f7', 'f7 = DecimalField()'),
@@ -428,7 +467,7 @@ class TestReflection(BaseReflectionTestCase):
                 ('_name', '_name = CharField()'),
             )),
             ('category', (
-                ('name', 'name = CharField()'),
+                ('name', 'name = CharField(max_length=10)'),
                 ('parent_id', 'parent = ForeignKeyField('
                  "column_name='parent_id', field='id', model='self', "
                  'null=True)'),
@@ -442,6 +481,40 @@ class TestReflection(BaseReflectionTestCase):
                 actual = columns[table][field_name].get_field()
                 self.assertTrue(actual in fields,
                                 '%s not in %s' % (actual, fields))
+
+
+class NoPK(TestModel):
+    data = CharField()
+    class Meta:
+        primary_key = False
+
+
+class NoPKId(TestModel):
+    id = IntegerField()
+    data = CharField()
+    class Meta:
+        primary_key = False
+
+
+class TestReflectNoPK(BaseReflectionTestCase):
+    requires = [NoPK, NoPKId]
+
+    def test_no_pk(self):
+        models = self.introspector.generate_models()
+        NoPK = models['no_pk']
+        NoPKId = models['no_pk_id']
+        if IS_CRDB:
+            # CockroachDB always includes a "rowid".
+            self.assertEqual(NoPK._meta.sorted_field_names, ['rowid', 'data'])
+            self.assertEqual(NoPKId._meta.sorted_field_names,
+                             ['rowid', 'id', 'data'])
+        else:
+            self.assertEqual(NoPK._meta.sorted_field_names, ['data'])
+            self.assertTrue(NoPK._meta.primary_key is False)
+            # An "id" column without a constraint is not a key either.
+            self.assertEqual(NoPKId._meta.sorted_field_names, ['id', 'data'])
+            self.assertTrue(NoPKId._meta.primary_key is False)
+            self.assertTrue(isinstance(NoPKId.id, IntegerField))
 
 
 class EventLog(TestModel):
@@ -528,6 +601,75 @@ class TestReflectionDependencies(BaseReflectionTestCase):
         self.assertEqual(set(models), set(('users',)))
 
 
+@requires_postgresql
+class TestCrossSchemaForeignKey(ModelTestCase):
+    def setUp(self):
+        super(TestCrossSchemaForeignKey, self).setUp()
+        with self.database:
+            for query in (
+                    'create schema rs1', 'create schema rs2',
+                    'create table rs1.author (id serial primary key)',
+                    'create table rs2.book (id serial primary key, '
+                    'author_id integer not null references rs1.author (id))'):
+                self.database.execute_sql(query)
+
+    def tearDown(self):
+        with self.database:
+            self.database.execute_sql('drop schema rs1 cascade')
+            self.database.execute_sql('drop schema rs2 cascade')
+        super(TestCrossSchemaForeignKey, self).tearDown()
+
+    def test_cross_schema_foreign_key(self):
+        # The FK target is in another schema: warn, leave a plain column.
+        introspector = Introspector.from_database(self.database, schema='rs2')
+        for kwargs in ({}, {'table_names': ['book']}):
+            with warnings.catch_warnings(record=True) as ws:
+                warnings.simplefilter('always')
+                models = introspector.generate_models(**kwargs)
+            self.assertEqual(set(models), set(('book',)))
+            self.assertTrue(isinstance(models['book'].author_id,
+                                       IntegerField))
+            self.assertTrue(any('author' in str(w.message) for w in ws))
+
+
+@requires_postgresql
+class TestReflectSearchPath(ModelTestCase):
+    # With no schema given, reflection follows the search path.
+    schema = 'rspath'
+
+    def setUp(self):
+        super(TestReflectSearchPath, self).setUp()
+        for query in (
+                'DROP SCHEMA IF EXISTS %s CASCADE' % self.schema,
+                'CREATE SCHEMA %s' % self.schema,
+                'CREATE TABLE %s.parent (id SERIAL PRIMARY KEY)' % self.schema,
+                'CREATE TABLE %s.child (id SERIAL PRIMARY KEY, '
+                'parent_id INTEGER REFERENCES %s.parent (id), name TEXT, '
+                'tags TEXT[])' % (self.schema, self.schema),
+                'CREATE INDEX child_name ON %s.child (name)' % self.schema,
+                'SET search_path TO %s' % self.schema):
+            self.database.execute_sql(query)
+
+    def tearDown(self):
+        try:
+            self.database.execute_sql('DROP SCHEMA IF EXISTS %s CASCADE'
+                                      % self.schema)
+        finally:
+            super(TestReflectSearchPath, self).tearDown()
+
+    def test_search_path(self):
+        models = generate_models(self.database)
+        self.assertEqual(sorted(models), ['child', 'parent'])
+        Child = models['child']
+        self.assertEqual(Child._meta.sorted_field_names,
+                         ['id', 'parent', 'name', 'tags'])
+        self.assertTrue(isinstance(Child.id, AutoField))
+        self.assertTrue(Child.parent.rel_model is models['parent'])
+        self.assertTrue(Child.name.index)
+        self.assertEqual(Child.tags.field_type, 'TEXT')
+        self.assertEqual(Child.tags.__class__.__name__, 'ArrayField')
+
+
 class Note(TestModel):
     content = TextField()
     timestamp = DateTimeField(default=datetime.datetime.now)
@@ -561,7 +703,6 @@ class TestReflectViews(BaseReflectionTestCase):
         self.assertTrue(isinstance(NotesPublic.content, TextField))
         self.assertTrue(isinstance(NotesPublic.timestamp, DateTimeField))
 
-    @skip_if(IS_SQLITE_OLD)
     @skip_if(IS_CRDB, 'crdb does not respect order by in view def')
     def test_introspect_view_integration(self):
         for i, (ct, st) in enumerate([('n1', 1), ('n2', 2), ('n3', 1)]):
@@ -576,28 +717,35 @@ class TestReflectViews(BaseReflectionTestCase):
 
 
 class TestCyclicalFK(BaseReflectionTestCase):
-    def setUp(self):
-        super(TestCyclicalFK, self).setUp()
-        warnings.filterwarnings('ignore')
+    def tearDown(self):
+        # Raw tables, so ModelTestCase will not clean them up. Leaving them
+        # behind makes every later whole-database introspection warn about
+        # the cycle.
+        for table in ('flow_run_state', 'flow_run'):
+            self.database.execute_sql('DROP TABLE IF EXISTS %s' % table)
+        super(TestCyclicalFK, self).tearDown()
 
     @requires_sqlite
+    @skip_if(IS_CYSQLITE, 'cysqlite does not implement cursor at the moment.')
     def test_cyclical_fk(self):
-        # NOTE: this schema was provided by a user.
-        cursor = self.database.cursor()
-        cursor.executescript(
-            'CREATE TABLE flow_run_state (id CHAR(36) NOT NULL, '
-            'flow_run_id CHAR(36) NOT NULL, '
-	    'CONSTRAINT pk_flow_run_state PRIMARY KEY (id), '
-	    'CONSTRAINT fk_flow_run_state__flow_run_id__flow_run '
-            'FOREIGN KEY(flow_run_id) REFERENCES flow_run (id) '
-            'ON DELETE cascade); '
-            'CREATE TABLE flow_run (id CHAR(36) NOT NULL, '
-	    'state_id CHAR(36) NOT NULL, '
-	    'CONSTRAINT pk_flow_run PRIMARY KEY (id), '
-	    'CONSTRAINT fk_flow_run__state_id__flow_run_state '
-            'FOREIGN KEY(state_id) REFERENCES flow_run_state (id) '
-            'ON DELETE SET NULL);')
-        M = self.introspector.generate_models()
+        with warnings.catch_warnings():
+            warnings.filterwarnings('ignore')
+            # NOTE: this schema was provided by a user.
+            cursor = self.database.cursor()
+            cursor.executescript(
+                'CREATE TABLE flow_run_state (id CHAR(36) NOT NULL, '
+                'flow_run_id CHAR(36) NOT NULL, '
+                'CONSTRAINT pk_flow_run_state PRIMARY KEY (id), '
+                'CONSTRAINT fk_flow_run_state__flow_run_id__flow_run '
+                'FOREIGN KEY(flow_run_id) REFERENCES flow_run (id) '
+                'ON DELETE cascade); '
+                'CREATE TABLE flow_run (id CHAR(36) NOT NULL, '
+                'state_id CHAR(36) NOT NULL, '
+                'CONSTRAINT pk_flow_run PRIMARY KEY (id), '
+                'CONSTRAINT fk_flow_run__state_id__flow_run_state '
+                'FOREIGN KEY(state_id) REFERENCES flow_run_state (id) '
+                'ON DELETE SET NULL);')
+            M = self.introspector.generate_models()
         FRS = M['flow_run_state']
         FR = M['flow_run']
         self.assertEqual(sorted(FR._meta.fields), ['id', 'state'])
@@ -635,3 +783,130 @@ class TestInteractiveHelpers(ModelTestCase):
             ('key', 'TEXT'),
             ('timestamp', 'DATETIME'),
             ('metadata', 'TEXT')])
+
+
+class Facets(TestModel):
+    char50 = CharField(max_length=50)
+    dec = DecimalField(max_digits=10, decimal_places=2)
+    truthy = BooleanField()
+    blob = BlobField()
+    dbl = DoubleField()
+    small = SmallIntegerField()
+    timestamp = DateTimeField(index=True)
+
+
+class FacetParent(TestModel):
+    name = CharField(default='')
+
+class FacetChild(TestModel):
+    parent = ForeignKeyField(FacetParent, backref='kids',
+                             on_delete='CASCADE', on_update='CASCADE')
+
+
+@skip_if(IS_CRDB)
+class TestReflectionFacets(BaseReflectionTestCase):
+    requires = [Facets, FacetParent, FacetChild]
+
+    def test_field_type_parameters(self):
+        models = self.introspector.generate_models()
+        F = models[Facets._meta.table_name]
+        self.assertEqual(F.char50.max_length, 50)
+        self.assertEqual(F.dec.max_digits, 10)
+        self.assertEqual(F.dec.decimal_places, 2)
+
+    def test_bare_fields_type_parameters(self):
+        models = self.introspector.generate_models(bare_fields=True)
+        F = models[Facets._meta.table_name]
+        self.assertTrue(type(F.char50) is BareField)
+        self.assertTrue(type(F.dec) is BareField)
+
+    def test_field_classes(self):
+        models = self.introspector.generate_models()
+        F = models[Facets._meta.table_name]
+        if IS_SQLITE:
+            # Truthy/small are stored with INTEGER affinity, dbl as REAL.
+            expected = (IntegerField, BlobField, FloatField, IntegerField)
+        else:
+            expected = (BooleanField, BlobField, DoubleField,
+                        SmallIntegerField)
+        for name, field_class in zip(('truthy', 'blob', 'dbl', 'small'),
+                                     expected):
+            self.assertTrue(type(getattr(F, name)) is field_class,
+                            '%s: %s' % (name, type(getattr(F, name))))
+
+    def test_reserved_word_index(self):
+        models = self.introspector.generate_models()
+        F = models[Facets._meta.table_name]
+        self.assertTrue(F.timestamp.index)
+        self.assertTrue(type(F.timestamp) is DateTimeField)
+
+    def test_fk_actions(self):
+        models = self.introspector.generate_models()
+        C = models[FacetChild._meta.table_name]
+        fk = C._meta.columns['parent_id']
+        self.assertEqual(fk.on_delete, 'CASCADE')
+        self.assertEqual(fk.on_update, 'CASCADE')
+
+    def test_int_pk_not_promoted(self):
+        self.database.execute_sql('DROP TABLE IF EXISTS facet_intpk')
+        self.database.execute_sql(
+            'CREATE TABLE facet_intpk ('
+            'id INTEGER NOT NULL PRIMARY KEY, data TEXT)')
+        try:
+            models = self.introspector.generate_models(
+                table_names=['facet_intpk'])
+            pk = models['facet_intpk']._meta.primary_key
+            if IS_SQLITE:
+                # An INTEGER pk is a rowid alias, i.e. auto-incrementing.
+                self.assertTrue(isinstance(pk, AutoField))
+            else:
+                self.assertFalse(isinstance(pk, AutoField))
+                self.assertTrue(pk.primary_key)
+        finally:
+            self.database.execute_sql('DROP TABLE facet_intpk')
+
+    def test_composite_pk_order(self):
+        # Key order, not table order, including the renamed fk column.
+        self.database.execute_sql('DROP TABLE IF EXISTS facet_comppk')
+        self.database.execute_sql(
+            'CREATE TABLE facet_comppk (tag VARCHAR(10) NOT NULL, '
+            'parent_id INTEGER NOT NULL, PRIMARY KEY (parent_id, tag), '
+            'FOREIGN KEY (parent_id) REFERENCES %s (id))' %
+            FacetParent._meta.table_name)
+        try:
+            models = self.introspector.generate_models(
+                table_names=['facet_comppk'])
+            pk = models['facet_comppk']._meta.primary_key
+            self.assertEqual(pk.field_names, ('parent', 'tag'))
+        finally:
+            self.database.execute_sql('DROP TABLE facet_comppk')
+
+    @skip_if(IS_MYSQL, 'mysql does not support partial indexes')
+    def test_partial_index_skipped(self):
+        table = Facets._meta.table_name
+        self.database.execute_sql(
+            'CREATE INDEX facets_partial ON %s (char50) WHERE dec > 0'
+            % table)
+        try:
+            metadata = self.introspector.introspect(table_names=[table])
+            column = metadata.columns[table]['char50']
+            self.assertFalse(column.index)
+            unhandled = metadata.unhandled_indexes(table)
+            self.assertEqual([idx.name for idx in unhandled],
+                             ['facets_partial'])
+        finally:
+            self.database.execute_sql('DROP INDEX facets_partial')
+
+    @skip_if(IS_MYSQL, 'mysql functional indexes are not reflected')
+    def test_expression_index_skipped(self):
+        table = Facets._meta.table_name
+        self.database.execute_sql(
+            'CREATE INDEX facets_expr ON %s (LOWER(char50))' % table)
+        try:
+            metadata = self.introspector.introspect(table_names=[table])
+            self.assertFalse(metadata.columns[table]['char50'].index)
+            unhandled = metadata.unhandled_indexes(table)
+            self.assertEqual([idx.name for idx in unhandled],
+                             ['facets_expr'])
+        finally:
+            self.database.execute_sql('DROP INDEX facets_expr')

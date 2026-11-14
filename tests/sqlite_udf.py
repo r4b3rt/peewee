@@ -3,19 +3,13 @@ import json
 import random
 
 from peewee import *
-from peewee import sqlite3
-from playhouse.sqlite_ext import SqliteExtDatabase
 from playhouse.sqlite_udf import register_all
 
-from .base import IS_SQLITE_9
 from .base import ModelTestCase
 from .base import TestModel
-from .base import db_loader
+from .base import get_sqlite_db
 from .base import skip_unless
-try:
-    from playhouse import _sqlite_ext as cython_ext
-except ImportError:
-    cython_ext = None
+from .base_models import User
 try:
     from playhouse import _sqlite_udf as cython_udf
 except ImportError:
@@ -26,12 +20,8 @@ def requires_cython(method):
     return skip_unless(cython_udf is not None,
                        'requires sqlite udf c extension')(method)
 
-database = db_loader('sqlite')
+database = get_sqlite_db()
 register_all(database)
-
-
-class User(TestModel):
-    username = TextField()
 
 
 class APIResponse(TestModel):
@@ -275,6 +265,7 @@ class TestScalarFunctions(BaseTestUDF):
             data = (
                 'a',
                 'a' * 1024,
+                'caf\xe9 ☃',
                 randstr(1024),
                 randstr(4096),
                 randstr(1024 * 64))
@@ -315,7 +306,6 @@ class TestScalarFunctions(BaseTestUDF):
             ('a.b.c.peewee', 1),
             ('a.charlesleifer.com', 1)])
 
-    @skip_unless(IS_SQLITE_9, 'requires sqlite >= 3.9')
     def test_toggle(self):
         self.assertEqual(self.sql1('select toggle(?)', 'foo'), 1)
         self.assertEqual(self.sql1('select toggle(?)', 'bar'), 1)
@@ -415,76 +405,3 @@ class TestScalarFunctions(BaseTestUDF):
         self.assertEqual(
             self.sql1('select strip_chars(?, ?)', '  hey foo ', ' '),
             'hey foo')
-
-
-@skip_unless(cython_ext is not None, 'requires sqlite c extension')
-@skip_unless(sqlite3.sqlite_version_info >= (3, 9), 'requires sqlite >= 3.9')
-class TestVirtualTableFunctions(ModelTestCase):
-    database = database
-    requires = MODELS
-
-    def sqln(self, sql, *p):
-        cursor = self.database.execute_sql(sql, p)
-        return cursor.fetchall()
-
-    def test_regex_search(self):
-        usernames = [
-            'charlie',
-            'hu3y17',
-            'zaizee2012',
-            '1234.56789',
-            'hurr durr']
-        for username in usernames:
-            User.create(username=username)
-
-        rgx = '[0-9]+'
-        results = self.sqln(
-            ('SELECT user.username, regex_search.match '
-             'FROM user, regex_search(?, user.username) '
-             'ORDER BY regex_search.match'),
-            rgx)
-        self.assertEqual([row for row in results], [
-            ('1234.56789', '1234'),
-            ('hu3y17', '17'),
-            ('zaizee2012', '2012'),
-            ('hu3y17', '3'),
-            ('1234.56789', '56789'),
-        ])
-
-    def test_date_series(self):
-        ONE_DAY = 86400
-        def assertValues(start, stop, step_seconds, expected):
-            results = self.sqln('select * from date_series(?, ?, ?)',
-                                start, stop, step_seconds)
-            self.assertEqual(results, expected)
-
-        assertValues('2015-01-01', '2015-01-05', 86400, [
-            ('2015-01-01',),
-            ('2015-01-02',),
-            ('2015-01-03',),
-            ('2015-01-04',),
-            ('2015-01-05',),
-        ])
-
-        assertValues('2015-01-01', '2015-01-05', 86400 / 2, [
-            ('2015-01-01 00:00:00',),
-            ('2015-01-01 12:00:00',),
-            ('2015-01-02 00:00:00',),
-            ('2015-01-02 12:00:00',),
-            ('2015-01-03 00:00:00',),
-            ('2015-01-03 12:00:00',),
-            ('2015-01-04 00:00:00',),
-            ('2015-01-04 12:00:00',),
-            ('2015-01-05 00:00:00',),
-        ])
-
-        assertValues('14:20:15', '14:24', 30, [
-            ('14:20:15',),
-            ('14:20:45',),
-            ('14:21:15',),
-            ('14:21:45',),
-            ('14:22:15',),
-            ('14:22:45',),
-            ('14:23:15',),
-            ('14:23:45',),
-        ])

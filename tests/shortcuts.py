@@ -1,4 +1,5 @@
 import operator
+import threading
 
 from peewee import *
 from playhouse.shortcuts import *
@@ -34,6 +35,13 @@ class TweetTag(TestModel):
 
     class Meta:
         primary_key = CompositeKey('tweet', 'tag')
+
+class LP(TestModel):
+    name = CharField()
+
+class LC(TestModel):
+    name = CharField(primary_key=True)
+    parent = ForeignKeyField(LP, lazy_load=False)
 
 class Owner(TestModel):
     name = TextField()
@@ -83,13 +91,59 @@ class Item(TestModel):
     basket = ForeignKeyField(Basket)
 
 
+class NodeTag(TestModel):
+    tag = TextField()
+
+class Node(TestModel):
+    name = TextField()
+    tag = ForeignKeyField(NodeTag)
+    parent = ForeignKeyField('self', null=True, backref='children')
+
+
 class TestModelToDict(ModelTestCase):
-    database = get_in_memory_db()
     requires = [User, Tweet, Tag, TweetTag]
 
     def setUp(self):
         super(TestModelToDict, self).setUp()
         self.user = User.create(username='peewee')
+
+    @requires_models(Node, NodeTag)
+    def test_self_referential(self):
+        a, b = [NodeTag.create(tag=tag) for tag in 'ab']
+        root = Node.create(name='root', tag=a)
+        n1 = Node.create(name='n1', parent=root, tag=a)
+        n2 = Node.create(name='n2', parent=root, tag=b)
+        Parent = Node.alias('parent')
+        ParentTag = NodeTag.alias('parent_tag')
+
+        def assertSerialization(n, expected):
+            obj = (Node
+                   .select(Node, NodeTag, Parent, ParentTag)
+                   .join_from(Node, NodeTag, JOIN.LEFT_OUTER)
+                   .join_from(Node, Parent, JOIN.LEFT_OUTER)
+                   .join_from(Parent, ParentTag, JOIN.LEFT_OUTER)
+                   .where(Node.name == n)
+                   .first())
+
+            self.assertEqual(model_to_dict(obj, recurse=True), expected)
+
+        assertSerialization('n1', {
+            'id': n1.id,
+            'name': 'n1',
+            'parent': {'id': root.id, 'name': 'root',
+                       'tag': {'id': a.id, 'tag': 'a'}},
+            'tag': {'id': a.id, 'tag': 'a'}})
+        assertSerialization('n2', {
+            'id': n2.id,
+            'name': 'n2',
+            'parent': {'id': root.id, 'name': 'root',
+                       'tag': {'id': a.id, 'tag': 'a'}},
+            'tag': {'id': b.id, 'tag': 'b'}})
+        assertSerialization('root', {
+            'id': root.id,
+            'name': 'root',
+            'parent': None,
+            'tag': {'id': a.id, 'tag': 'a'}})
 
     def test_simple(self):
         with self.assertQueryCount(0):
@@ -138,6 +192,18 @@ class TestModelToDict(ModelTestCase):
                 'content': 't0',
                 'tweettag_set': [],
                 'user': {'id': self.user.id, 'username': 'peewee'}})
+
+    @requires_models(LP, LC)
+    def test_no_lazy_load(self):
+        lp = LP.create(name='lp')
+        l1 = LC.create(name='l1', parent=lp)
+        l2 = LC.create(name='l2', parent=lp.id)
+
+        with self.assertQueryCount(0):
+            self.assertEqual(model_to_dict(l1, recurse=True), {
+                'name': 'l1', 'parent': lp.id})
+            self.assertEqual(model_to_dict(l2, recurse=True), {
+                'name': 'l2', 'parent': lp.id})
 
     @requires_models(Category)
     def test_recursive_fk(self):
@@ -215,21 +281,38 @@ class TestModelToDict(ModelTestCase):
                  .order_by(Gallery.id))
         rows = [model_to_dict(gallery, backrefs=True, manytomany=True)
                 for gallery in query]
+        gid = dict(Gallery.select(Gallery.name, Gallery.id).tuples())
+        oid = dict(Owner.select(Owner.name, Owner.id).tuples())
+        lid = dict(Label.select(Label.label, Label.id).tuples())
         self.assertEqual(rows, [
             {
-                'id': 1,
+                'id': gid['family'],
                 'name': 'family',
-                'owner': {'id': 1, 'name': 'charlie'},
-                'labels': [{'id': 1, 'label': 'nuggie'},
-                           {'id': 2, 'label': 'bearbe'}],
+                'owner': {'id': oid['charlie'], 'name': 'charlie'},
+                'labels': [{'id': lid['nuggie'], 'label': 'nuggie'},
+                           {'id': lid['bearbe'], 'label': 'bearbe'}],
             },
             {
-                'id': 3,
+                'id': gid['misc'],
                 'name': 'misc',
-                'owner': {'id': 2, 'name': 'peewee'},
-                'labels': [{'id': 1, 'label': 'nuggie'},
-                           {'id': 3, 'label': 'huey'}],
+                'owner': {'id': oid['peewee'], 'name': 'peewee'},
+                'labels': [{'id': lid['nuggie'], 'label': 'nuggie'},
+                           {'id': lid['huey'], 'label': 'huey'}],
             }])
+
+    @requires_models(Student, Course, StudentCourse)
+    def test_manytomany_only_exclude(self):
+        s = Student.create(name='huey')
+        c = Course.create(name='math')
+        StudentCourse.create(student=s, course=c)
+
+        data = model_to_dict(s, manytomany=True, exclude=[Student.courses])
+        self.assertTrue('courses' not in data)
+
+        data = model_to_dict(s, manytomany=True,
+                             only=[Student.name, Student.courses])
+        self.assertTrue('courses' in data)
+        self.assertEqual(data['name'], 'huey')
 
     @requires_models(Student, Course, StudentCourse)
     def test_manytomany_deferred(self):
@@ -237,13 +320,13 @@ class TestModelToDict(ModelTestCase):
             ('s1', ('ca', 'cb', 'cc')),
             ('s2', ('cb', 'cd')),
             ('s3', ()))
-        c = {}
+        c, s = {}, {}
         for student, courses in data:
-            s = Student.create(name=student)
+            s[student] = Student.create(name=student)
             for course in courses:
                 if course not in c:
                     c[course] = Course.create(name=course)
-                StudentCourse.create(student=s, course=c[course])
+                StudentCourse.create(student=s[student], course=c[course])
 
         query = Student.select().order_by(Student.name)
         data = []
@@ -253,14 +336,14 @@ class TestModelToDict(ModelTestCase):
             data.append(user_dict)
 
         self.assertEqual(data, [
-            {'id': 1, 'name': 's1', 'courses': [
-                {'id': 1, 'name': 'ca'},
-                {'id': 2, 'name': 'cb'},
-                {'id': 3, 'name': 'cc'}]},
-            {'id': 2, 'name': 's2', 'courses': [
-                {'id': 2, 'name': 'cb'},
-                {'id': 4, 'name': 'cd'}]},
-            {'id': 3, 'name': 's3', 'courses': []}])
+            {'id': s['s1'].id, 'name': 's1', 'courses': [
+                {'id': c['ca'].id, 'name': 'ca'},
+                {'id': c['cb'].id, 'name': 'cb'},
+                {'id': c['cc'].id, 'name': 'cc'}]},
+            {'id': s['s2'].id, 'name': 's2', 'courses': [
+                {'id': c['cb'].id, 'name': 'cb'},
+                {'id': c['cd'].id, 'name': 'cd'}]},
+            {'id': s['s3'].id, 'name': 's3', 'courses': []}])
 
         query = Course.select().order_by(Course.name)
         data = []
@@ -270,15 +353,15 @@ class TestModelToDict(ModelTestCase):
             data.append(course_dict)
 
         self.assertEqual(data, [
-            {'id': 1, 'name': 'ca', 'students': [
-                {'id': 1, 'name': 's1'}]},
-            {'id': 2, 'name': 'cb', 'students': [
-                {'id': 1, 'name': 's1'},
-                {'id': 2, 'name': 's2'}]},
-            {'id': 3, 'name': 'cc', 'students': [
-                {'id': 1, 'name': 's1'}]},
-            {'id': 4, 'name': 'cd', 'students': [
-                {'id': 2, 'name': 's2'}]}])
+            {'id': c['ca'].id, 'name': 'ca', 'students': [
+                {'id': s['s1'].id, 'name': 's1'}]},
+            {'id': c['cb'].id, 'name': 'cb', 'students': [
+                {'id': s['s1'].id, 'name': 's1'},
+                {'id': s['s2'].id, 'name': 's2'}]},
+            {'id': c['cc'].id, 'name': 'cc', 'students': [
+                {'id': s['s1'].id, 'name': 's1'}]},
+            {'id': c['cd'].id, 'name': 'cd', 'students': [
+                {'id': s['s2'].id, 'name': 's2'}]}])
 
     def test_recurse_max_depth(self):
         t0, t1, t2 = [Tweet.create(user=self.user, content='t%s' % i)
@@ -397,7 +480,7 @@ class TestModelToDict(ModelTestCase):
                  .select(User.username, fn.COUNT(Tweet.id).alias('ct'))
                  .join(Tweet, JOIN.LEFT_OUTER)
                  .group_by(User.username)
-                 .order_by(User.id))
+                 .order_by(User.username))
         with self.assertQueryCount(1):
             u0, u1, u2 = list(query)
             self.assertEqual(model_to_dict(u0, fields_from_query=query), {
@@ -425,6 +508,18 @@ class TestModelToDict(ModelTestCase):
                              {'magic': 1337, 'content': 'u0-0',
                               'user': {'username': 'u0'}})
 
+    def test_fields_from_query_alias(self):
+        q = User.select(User.username.alias('name'))
+        res = q[0]
+        self.assertEqual(model_to_dict(res, fields_from_query=q),
+                         {'name': 'peewee'})
+
+        UA = User.alias()
+        q = UA.select(UA.username.alias('name'))
+        res = q[0]
+        self.assertEqual(model_to_dict(res, fields_from_query=q),
+                         {'name': 'peewee'})
+
     def test_only_backref(self):
         for i in range(3):
             Tweet.create(user=self.user, content=str(i))
@@ -446,15 +541,15 @@ class TestModelToDict(ModelTestCase):
     def test_model_to_dict_disabled_backref(self):
         host = Host.create(name='pi')
         Device.create(host=host, name='raspberry pi')
-        Service.create(host=host, name='ssh')
-        Service.create(host=host, name='vpn')
+        ssh = Service.create(host=host, name='ssh')
+        vpn = Service.create(host=host, name='vpn')
 
         data = model_to_dict(host, recurse=True, backrefs=True)
         services = sorted(data.pop('services'), key=operator.itemgetter('id'))
-        self.assertEqual(data, {'id': 1, 'name': 'pi'})
+        self.assertEqual(data, {'id': host.id, 'name': 'pi'})
         self.assertEqual(services, [
-            {'id': 1, 'name': 'ssh'},
-            {'id': 2, 'name': 'vpn'}])
+            {'id': ssh.id, 'name': 'ssh'},
+            {'id': vpn.id, 'name': 'vpn'}])
 
     @requires_models(Basket, Item)
     def test_empty_vs_null_fk(self):
@@ -469,7 +564,6 @@ class TestModelToDict(ModelTestCase):
 
 
 class TestDictToModel(ModelTestCase):
-    database = get_in_memory_db()
     requires = [User, Tweet, Tag, TweetTag]
 
     def setUp(self):
@@ -577,13 +671,14 @@ class TestDictToModel(ModelTestCase):
 
 
 class ReconnectMySQLDatabase(ReconnectMixin, MySQLDatabase):
-    def cursor(self, commit):
-        cursor = super(ReconnectMySQLDatabase, self).cursor(commit)
+    def cursor(self, named_cursor=None):
+        cursor = super(ReconnectMySQLDatabase, self).cursor(named_cursor)
 
         # The first (0th) query fails, as do all queries after the 2nd (1st).
         if self._query_counter != 1:
-            def _fake_execute(self, _):
-                raise OperationalError('2006')
+            exc = self._reconnect_exc
+            def _fake_execute(self, *args):
+                raise exc
             cursor.execute = _fake_execute
         self._query_counter += 1
         return cursor
@@ -595,13 +690,14 @@ class ReconnectMySQLDatabase(ReconnectMixin, MySQLDatabase):
     def _reset_mock(self):
         self._close_counter = 0
         self._query_counter = 0
+        self._reconnect_exc = OperationalError('2006')
 
 
 @requires_mysql
 class TestReconnectMixin(DatabaseTestCase):
     database = db_loader('mysql', db_class=ReconnectMySQLDatabase)
 
-    def test_reconnect_mixin(self):
+    def test_reconnect_mixin_execute_sql(self):
         # Verify initial state.
         self.database._reset_mock()
         self.assertEqual(self.database._close_counter, 0)
@@ -612,7 +708,7 @@ class TestReconnectMixin(DatabaseTestCase):
         self.assertEqual(self.database._close_counter, 1)
 
         # Due to how we configured our mock, our queries are now failing and we
-        # can verify a reconnect is occuring *AND* the exception is propagated.
+        # can verify a reconnect is occurring AND the exception is propagated.
         self.assertRaises(OperationalError, self.database.execute_sql, sql)
         self.assertEqual(self.database._close_counter, 2)
 
@@ -623,6 +719,49 @@ class TestReconnectMixin(DatabaseTestCase):
         curs = self.database.execute_sql(sql)
         self.assertEqual(curs.fetchone(), (2,))
         self.assertEqual(self.database._close_counter, 1)
+
+
+    def test_reconnect_mixin_interface_error(self):
+        self.database._reset_mock()
+        self.database._reconnect_exc = InterfaceError("(0, '')")
+
+        curs = self.database.execute_sql('select 1 + 1')
+        self.assertEqual(curs.fetchone(), (2,))
+        self.assertEqual(self.database._close_counter, 1)
+
+    def test_reconnect_mixin_begin(self):
+        # Verify initial state.
+        self.database._reset_mock()
+        self.assertEqual(self.database._close_counter, 0)
+
+        with self.database.atomic():
+            self.assertTrue(self.database.in_transaction())
+            self.assertEqual(self.database._close_counter, 1)
+            # Prepare mock for commit call
+            self.database._query_counter = 1
+
+        # Due to how we configured our mock, our queries are now failing and we
+        # can verify a reconnect is occurring AND the exception is propagated.
+        self.assertRaises(OperationalError, self.database.atomic().__enter__)
+        self.assertEqual(self.database._close_counter, 2)
+        self.assertFalse(self.database.in_transaction())
+
+        # We reset the mock counters. The first query we execute will fail. The
+        # second query will succeed (which happens automatically, thanks to the
+        # retry logic).
+        self.database._reset_mock()
+        with self.database.atomic():
+            self.assertTrue(self.database.in_transaction())
+            self.assertEqual(self.database._close_counter, 1)
+
+            # Do not reconnect when nesting transactions
+            self.assertRaises(OperationalError,
+                              self.database.atomic().__enter__)
+            self.assertEqual(self.database._close_counter, 1)
+
+            # Prepare mock for commit call
+            self.database._query_counter = 1
+        self.assertFalse(self.database.in_transaction())
 
 
 class MMA(TestModel):
@@ -737,6 +876,45 @@ class TestThreadSafeDatabaseMetadata(BaseTestCase):
 
         # In the main thread the original database has not been altered.
         self.assertTrue(M._meta.database is d1)
+
+
+class TestThreadSafeMetaRegression(ModelTestCase):
+    def test_thread_safe_meta(self):
+        d1 = get_in_memory_db()
+        d2 = get_in_memory_db()
+
+        class Meta:
+            database = d1
+            model_metadata_class = ThreadSafeDatabaseMetadata
+        attrs = {'Meta': Meta}
+        for i in range(1, 30):
+            attrs['f%d' % i] = IntegerField()
+        M = type('M', (TestModel,), attrs)
+
+        sql = ('SELECT "t1"."f1", "t1"."f2", "t1"."f3", "t1"."f4" '
+               'FROM "m" AS "t1"')
+        query = M.select(M.f1, M.f2, M.f3, M.f4)
+
+        def swap_db():
+            for i in range(100):
+                self.assertEqual(M._meta.database, d1)
+                self.assertSQL(query, sql)
+                with d2.bind_ctx([M]):
+                    self.assertEqual(M._meta.database, d2)
+                    self.assertSQL(query, sql)
+                self.assertEqual(M._meta.database, d1)
+                self.assertSQL(query, sql)
+
+        # From a separate thread, swap the database and verify it works
+        # correctly.
+        threads = [threading.Thread(target=swap_db)
+                   for i in range(10)]
+        for t in threads: t.start()
+        for t in threads: t.join()
+
+        # In the main thread the original database has not been altered.
+        self.assertEqual(M._meta.database, d1)
+        self.assertSQL(query, sql)
 
 
 class TIW(TestModel):

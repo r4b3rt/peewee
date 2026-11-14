@@ -11,14 +11,15 @@ from .base import TestModel
 
 
 PASSPHRASE = 'testing sqlcipher'
-PRAGMAS = {'kdf_iter': 10}  # Much faster for testing. Totally unsafe.
+PRAGMAS = {
+    'kdf_iter': 10,   # Much faster for testing. Totally unsafe.
+    'cipher_log_level': 'none',
+}
 db = SqlCipherDatabase('peewee_test.dbc', passphrase=PASSPHRASE,
-                       pragmas=PRAGMAS)
-ext_db = SqlCipherExtDatabase('peewee_test.dbx', passphrase=PASSPHRASE,
-                              pragmas=PRAGMAS)
+                       pragmas=PRAGMAS, rank_functions=True)
 
 
-@ext_db.func('shazam')
+@db.func('shazam')
 def shazam(s):
     return sha1((s or '').encode('utf-8')).hexdigest()[:5]
 
@@ -43,7 +44,7 @@ class CleanUpModelTestCase(ModelTestCase):
             os.unlink(self.database.database)
 
 
-class SqlCipherTestCase(CleanUpModelTestCase):
+class TestSqlCipher(CleanUpModelTestCase):
     database = db
     requires = [Thing]
 
@@ -118,19 +119,19 @@ class TestSqlCipherConfiguration(CleanUpModelTestCase):
         self.assertTrue('foo' in self.database.get_tables())
 
 
-class SqlCipherExtTestCase(CleanUpModelTestCase):
-    database = ext_db
+class TestSqlCipherExt(CleanUpModelTestCase):
+    database = db
     requires = [Note]
 
     def setUp(self):
-        super(SqlCipherExtTestCase, self).setUp()
-        FTSNote._meta.database = ext_db
+        super(TestSqlCipherExt, self).setUp()
+        FTSNote._meta.database = db
         FTSNote.drop_table(True)
-        FTSNote.create_table(tokenize='porter', content=Note.content)
+        FTSNote.create_table(tokenize='porter', content=Note)
 
     def tearDown(self):
         FTSNote.drop_table(True)
-        super(SqlCipherExtTestCase, self).tearDown()
+        super(TestSqlCipherExt, self).tearDown()
 
     def test_fts(self):
         strings = [
@@ -151,7 +152,7 @@ class SqlCipherExtTestCase(CleanUpModelTestCase):
             'relational databases are the best',
             'sqlite is the best relational database'])
 
-        alt_conn = SqliteDatabase(ext_db.database)
+        alt_conn = SqliteDatabase(db.database)
         self.assertRaises(
             DatabaseError,
             alt_conn.execute_sql,

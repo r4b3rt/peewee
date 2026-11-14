@@ -2,13 +2,14 @@ import datetime
 import functools
 import os
 import re
-import urllib
+from urllib.parse import urlencode
 
-from flask import (Flask, flash, Markup, redirect, render_template, request,
+from flask import (Flask, flash, redirect, render_template, request,
                    Response, session, url_for)
 from markdown import markdown
 from markdown.extensions.codehilite import CodeHiliteExtension
 from markdown.extensions.extra import ExtraExtension
+from markupsafe import Markup
 from micawber import bootstrap_basic, parse_html
 from micawber.cache import Cache as OEmbedCache
 from peewee import *
@@ -25,7 +26,7 @@ ADMIN_PASSWORD = 'secret'
 APP_DIR = os.path.dirname(os.path.realpath(__file__))
 
 # The playhouse.flask_utils.FlaskDB object accepts database URL configuration.
-DATABASE = 'sqliteext:///%s' % os.path.join(APP_DIR, 'blog.db')
+DATABASE = 'sqlite:///%s' % os.path.join(APP_DIR, 'blog.db')
 DEBUG = False
 
 # The secret key is used internally by Flask to encrypt session data stored
@@ -90,23 +91,13 @@ class Entry(flask_db.Model):
         return ret
 
     def update_search_index(self):
-        # Create a row in the FTSEntry table with the post content. This will
-        # allow us to use SQLite's awesome full-text search extension to
-        # search our entries.
-        exists = (FTSEntry
-                  .select(FTSEntry.docid)
-                  .where(FTSEntry.docid == self.id)
-                  .exists())
-        content = '\n'.join((self.title, self.content))
-        if exists:
-            (FTSEntry
-             .update({FTSEntry.content: content})
-             .where(FTSEntry.docid == self.id)
-             .execute())
-        else:
-            FTSEntry.insert({
-                FTSEntry.docid: self.id,
-                FTSEntry.content: content}).execute()
+        # Store the post content in the FTSEntry table so we can use SQLite's
+        # full-text search extension to search our entries. The search index
+        # rowid is the entry id, which is how we join the two back together.
+        # Replace acts as an upsert, so this handles new and edited entries.
+        FTSEntry.replace(
+            rowid=self.id,
+            content='\n'.join((self.title, self.content))).execute()
 
     @classmethod
     def public(cls):
@@ -118,26 +109,25 @@ class Entry(flask_db.Model):
 
     @classmethod
     def search(cls, query):
-        words = [word.strip() for word in query.split() if word.strip()]
-        if not words:
-            # Return an empty query.
-            return Entry.noop()
-        else:
-            search = ' '.join(words)
+        # Whatever the user typed in the search box is translated into a valid
+        # FTS5 query, so quoted phrases, OR/NOT and -exclusions work, and
+        # nothing they can type raises an error. An empty search box matches
+        # no entries.
+        search = FTSEntry.web_query(query)
 
         # Query the full-text search index for entries matching the given
         # search query, then join the actual Entry data on the matching
         # search result.
         return (Entry
                 .select(Entry, FTSEntry.rank().alias('score'))
-                .join(FTSEntry, on=(Entry.id == FTSEntry.docid))
+                .join(FTSEntry, on=(Entry.id == FTSEntry.rowid))
                 .where(
                     FTSEntry.match(search) &
                     (Entry.published == True))
                 .order_by(SQL('score')))
 
-class FTSEntry(FTSModel):
-    content = TextField()
+class FTSEntry(FTS5Model):
+    content = SearchField()
 
     class Meta:
         database = database
@@ -183,8 +173,7 @@ def index():
 
     # The `object_list` helper will take a base query and then handle
     # paginating the results if there are more than 20. For more info see
-    # the docs:
-    # http://docs.peewee-orm.com/en/latest/peewee/playhouse.html#object_list
+    # the docs: https://docs.peewee-orm.com/
     return object_list(
         'index.html',
         query,
@@ -252,7 +241,7 @@ def clean_querystring(request_args, *keys_to_remove, **new_values):
     for key in keys_to_remove:
         querystring.pop(key, None)
     querystring.update(new_values)
-    return urllib.urlencode(querystring)
+    return urlencode(querystring)
 
 @app.errorhandler(404)
 def not_found(exc):
@@ -263,4 +252,7 @@ def main():
     app.run(debug=True)
 
 if __name__ == '__main__':
+    print('To login, open:')
+    print('http://127.0.0.1:5000/login/')
+    print('password is: %s' % ADMIN_PASSWORD)
     main()

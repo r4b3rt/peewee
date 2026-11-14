@@ -1,7 +1,6 @@
 #!/usr/bin/env python
 import optparse
 import os
-import shutil
 import sys
 import unittest
 
@@ -23,12 +22,17 @@ def get_option_parser():
         '--engine',
         dest='engine',
         help=('Database engine to test, one of '
-              '[sqlite, postgres, mysql, mysqlconnector, apsw, sqlcipher,'
-              ' cockroachdb]'))
+              '[sqlite, cysqlite, postgres, psycopg3, mysql, mysqlconnector,'
+              ' mariadb, cockroachdb]'))
     basic.add_option('-v', '--verbosity', dest='verbosity', default=1,
                      type='int', help='Verbosity of output')
     basic.add_option('-f', '--failfast', action='store_true', default=False,
                      dest='failfast', help='Exit on first failure/error.')
+    basic.add_option('-a', '--asyncio', action='store_true', default=False,
+                     dest='asyncio_tests', help='Run only asyncio tests.')
+    basic.add_option('-A', '--asyncio-stress', action='store_true',
+                     default=False, dest='asyncio_stress_test',
+                     help='Run asyncio stress test.')
     parser.add_option_group(basic)
 
     db_param_map = (
@@ -75,6 +79,19 @@ def collect_tests(args):
 
     return suite
 
+def collect_asyncio_tests():
+    try:
+        import aiosqlite
+    except ImportError:
+        raise RuntimeError('Need aiosqlite at minimum to run asyncio tests.')
+
+    suite = unittest.TestSuite()
+    from tests import pwasyncio
+    module_suite = unittest.TestLoader().loadTestsFromModule(pwasyncio)
+    suite.addTest(module_suite)
+    return suite
+
+
 if __name__ == '__main__':
     parser = get_option_parser()
     options, args = parser.parse_args()
@@ -91,22 +108,31 @@ if __name__ == '__main__':
 
     os.environ['PEEWEE_TEST_VERBOSITY'] = str(options.verbosity)
 
-    suite = collect_tests(args)
+    if options.asyncio_tests:
+        suite = collect_asyncio_tests()
+    elif options.asyncio_stress_test:
+        try:
+            import asyncio
+            from tests.pwasyncio_stress import main
+        except ImportError as exc:
+            print('Error: could not import asyncio stress test: %s' % exc)
+            sys.exit(2)
+
+        sys.exit(asyncio.run(main()))
+    else:
+        suite = collect_tests(args)
+
     failures, errors = runtests(suite, options.verbosity, options.failfast)
 
     files_to_delete = [
         'peewee_test.db',
-        'peewee_test',
-        'tmp.db',
-        'peewee_test.bdb.db',
-        'peewee_test.cipher.db']
-    paths_to_delete = ['peewee_test.bdb.db-journal']
+        'peewee_test.db-shm',
+        'peewee_test.db-wal',
+        'peewee_test.dbc',
+        'peewee_pwiz.db']
     for filename in files_to_delete:
         if os.path.exists(filename):
             os.unlink(filename)
-    for path in paths_to_delete:
-        if os.path.exists(path):
-            shutil.rmtree(path)
 
     if errors:
         sys.exit(2)

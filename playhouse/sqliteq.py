@@ -1,24 +1,18 @@
 import logging
-import weakref
-from threading import local as thread_local
+from queue import Queue
 from threading import Event
+from threading import Lock
 from threading import Thread
-try:
-    from Queue import Queue
-except ImportError:
-    from queue import Queue
 
 try:
     import gevent
     from gevent import Greenlet as GThread
     from gevent.event import Event as GEvent
-    from gevent.local import local as greenlet_local
     from gevent.queue import Queue as GQueue
 except ImportError:
     GThread = GQueue = GEvent = None
 
-from peewee import SENTINEL
-from playhouse.sqlite_ext import SqliteExtDatabase
+from peewee import SqliteDatabase
 
 
 logger = logging.getLogger('peewee.sqliteq')
@@ -35,14 +29,13 @@ class ShutdownException(Exception):
 
 
 class AsyncCursor(object):
-    __slots__ = ('sql', 'params', 'commit', 'timeout',
+    __slots__ = ('sql', 'params', 'timeout',
                  '_event', '_cursor', '_exc', '_idx', '_rows', '_ready')
 
-    def __init__(self, event, sql, params, commit, timeout):
+    def __init__(self, event, sql, params, timeout):
         self._event = event
         self.sql = sql
         self.params = params
-        self.commit = commit
         self.timeout = timeout
         self._cursor = self._exc = self._idx = self._rows = None
         self._ready = False
@@ -57,7 +50,7 @@ class AsyncCursor(object):
 
     def _wait(self, timeout=None):
         timeout = timeout if timeout is not None else self.timeout
-        if not self._event.wait(timeout=timeout) and timeout:
+        if not self._event.wait(timeout=timeout) and timeout is not None:
             raise ResultTimeout('results not ready, timed out.')
         if self._exc is not None:
             raise self._exc
@@ -96,10 +89,14 @@ class AsyncCursor(object):
 
     @property
     def description(self):
+        if not self._ready:
+            self._wait()
         return self._cursor.description
 
     def close(self):
-        self._cursor.close()
+        if self._cursor is not None:
+            self._cursor.close()
+            self._cursor = None
 
     def fetchall(self):
         return list(self)  # Iterating implies waiting until populated.
@@ -113,6 +110,7 @@ class AsyncCursor(object):
             return None
 
 SHUTDOWN = StopIteration
+QUERY = object()
 PAUSE = object()
 UNPAUSE = object()
 
@@ -143,30 +141,34 @@ class Writer(object):
                 self.database._state.reset()
 
     def wait_unpause(self):
-        obj = self.queue.get()
-        if obj is UNPAUSE:
+        op, obj = self.queue.get()
+        if op is UNPAUSE:
             logger.info('writer unpaused - reconnecting to database.')
+            obj.set()
             return True
-        elif obj is SHUTDOWN:
+        elif op is SHUTDOWN:
             raise ShutdownException()
-        elif obj is PAUSE:
+        elif op is PAUSE:
             logger.error('writer received pause, but is already paused.')
+            obj.set()
         else:
             obj.set_result(None, WriterPaused())
             logger.warning('writer paused, not handling %s', obj)
 
     def loop(self, conn):
-        obj = self.queue.get()
-        if isinstance(obj, AsyncCursor):
+        op, obj = self.queue.get()
+        if op is QUERY:
             self.execute(obj)
-        elif obj is PAUSE:
+        elif op is PAUSE:
             logger.info('writer paused - closing database connection.')
             self.database._close(conn)
             self.database._state.reset()
+            obj.set()
             return
-        elif obj is UNPAUSE:
+        elif op is UNPAUSE:
             logger.error('writer received unpause, but is already running.')
-        elif obj is SHUTDOWN:
+            obj.set()
+        elif op is SHUTDOWN:
             raise ShutdownException()
         else:
             logger.error('writer received unsupported object: %s', obj)
@@ -175,7 +177,7 @@ class Writer(object):
     def execute(self, obj):
         logger.debug('received query %s', obj.sql)
         try:
-            cursor = self.database._execute(obj.sql, obj.params, obj.commit)
+            cursor = self.database._execute(obj.sql, obj.params)
         except Exception as execute_err:
             cursor = None
             exc = execute_err  # python3 is so fucking lame.
@@ -184,7 +186,7 @@ class Writer(object):
         return obj.set_result(cursor, exc)
 
 
-class SqliteQueueDatabase(SqliteExtDatabase):
+class SqliteQueueDatabase(SqliteDatabase):
     WAL_MODE_ERROR_MESSAGE = ('SQLite must be configured to use the WAL '
                               'journal mode when using this feature. WAL mode '
                               'allows one or more readers to continue reading '
@@ -194,6 +196,9 @@ class SqliteQueueDatabase(SqliteExtDatabase):
     def __init__(self, database, use_gevent=False, autostart=True,
                  queue_max_size=None, results_timeout=None, *args, **kwargs):
         kwargs['check_same_thread'] = False
+
+        # Lock around starting and stopping write thread operations.
+        self._qlock = Lock()
 
         # Ensure that journal_mode is WAL. This value is passed to the parent
         # class constructor below.
@@ -241,24 +246,20 @@ class SqliteQueueDatabase(SqliteExtDatabase):
     def queue_size(self):
         return self._write_queue.qsize()
 
-    def execute_sql(self, sql, params=None, commit=SENTINEL, timeout=None):
-        if commit is SENTINEL:
-            commit = not sql.lower().startswith('select')
-
-        if not commit:
-            return self._execute(sql, params, commit=commit)
+    def execute_sql(self, sql, params=None, timeout=None):
+        if sql.lower().startswith('select'):
+            return self._execute(sql, params)
 
         cursor = AsyncCursor(
             event=self._thread_helper.event(),
             sql=sql,
             params=params,
-            commit=commit,
             timeout=self._results_timeout if timeout is None else timeout)
-        self._write_queue.put(cursor)
+        self._write_queue.put((QUERY, cursor))
         return cursor
 
     def start(self):
-        with self._lock:
+        with self._qlock:
             if not self._is_stopped:
                 return False
             def run():
@@ -272,25 +273,49 @@ class SqliteQueueDatabase(SqliteExtDatabase):
 
     def stop(self):
         logger.debug('environment stop requested.')
-        with self._lock:
+        with self._qlock:
             if self._is_stopped:
                 return False
-            self._write_queue.put(SHUTDOWN)
-            self._writer.join()
+
+            self._write_queue.put((SHUTDOWN, None))
+            writer = self._writer
             self._is_stopped = True
-            return True
+
+        writer.join()
+
+        # Empty queue of any remaining tasks.
+        while not self._write_queue.empty():
+            op, obj = self._write_queue.get()
+            if op is PAUSE or op is UNPAUSE:
+                obj.set()
+            elif op is QUERY:
+                obj.set_result(None, ShutdownException())
+
+        return True
 
     def is_stopped(self):
-        with self._lock:
+        with self._qlock:
             return self._is_stopped
 
     def pause(self):
-        with self._lock:
-            self._write_queue.put(PAUSE)
+        with self._qlock:
+            if self._is_stopped:
+                return False
+
+            evt = self._thread_helper.event()
+            self._write_queue.put((PAUSE, evt))
+
+        evt.wait()
 
     def unpause(self):
-        with self._lock:
-            self._write_queue.put(UNPAUSE)
+        with self._qlock:
+            if self._is_stopped:
+                return False
+
+            evt = self._thread_helper.event()
+            self._write_queue.put((UNPAUSE, evt))
+
+        evt.wait()
 
     def __unsupported__(self, *args, **kwargs):
         raise ValueError('This method is not supported by %r.' % type(self))

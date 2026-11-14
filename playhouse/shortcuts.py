@@ -4,8 +4,6 @@ from peewee import *
 from peewee import Alias
 from peewee import CompoundSelectQuery
 from peewee import Metadata
-from peewee import SENTINEL
-from peewee import callable_
 
 
 _clone_set = lambda s: set(s) if s else set()
@@ -39,6 +37,7 @@ def model_to_dict(model, recurse=True, backrefs=False, only=None,
     should_skip = lambda n: (n in exclude) or (only and (n not in only))
 
     if fields_from_query is not None:
+        only.add('__sentinel__')  # Add a placeholder to make non-empty.
         for item in fields_from_query._returning:
             if isinstance(item, Field):
                 only.add(item)
@@ -53,7 +52,7 @@ def model_to_dict(model, recurse=True, backrefs=False, only=None,
 
     if manytomany:
         for name, m2m in model._meta.manytomany.items():
-            if should_skip(name):
+            if should_skip(m2m):
                 continue
 
             exclude.update((m2m, m2m.rel_model._meta.manytomany[m2m.backref]))
@@ -76,17 +75,18 @@ def model_to_dict(model, recurse=True, backrefs=False, only=None,
             continue
 
         field_data = model.__data__.get(field.name)
-        if isinstance(field, ForeignKeyField) and recurse:
-            if field_data is not None:
-                seen.add(field)
-                rel_obj = getattr(model, field.name)
+        if isinstance(field, ForeignKeyField) and recurse and field.lazy_load:
+            # rel_obj may be None despite a fk value: a cached outer-join miss.
+            rel_obj = getattr(model, field.name) \
+                if field_data is not None else None
+            if rel_obj is not None:
                 field_data = model_to_dict(
                     rel_obj,
                     recurse=recurse,
                     backrefs=backrefs,
                     only=only,
                     exclude=exclude,
-                    seen=seen,
+                    seen=seen | set((field,)),
                     max_depth=max_depth - 1)
             else:
                 field_data = None
@@ -96,7 +96,7 @@ def model_to_dict(model, recurse=True, backrefs=False, only=None,
     if extra_attrs:
         for attr_name in extra_attrs:
             attr = getattr(model, attr_name)
-            if callable_(attr):
+            if callable(attr):
                 data[attr_name] = attr()
             else:
                 data[attr_name] = attr
@@ -149,9 +149,8 @@ def update_model_from_dict(instance, data, ignore_unknown=False):
         is_foreign_key = isinstance(field, ForeignKeyField)
 
         if not is_backref and is_foreign_key and isinstance(value, dict):
-            try:
-                rel_instance = instance.__rel__[field.name]
-            except KeyError:
+            rel_instance = instance.__rel__.get(field.name)
+            if rel_instance is None:
                 rel_instance = field.rel_model()
             setattr(
                 instance,
@@ -201,7 +200,7 @@ def insert_where(cls, data, where=None):
     """
     for field, default in cls._meta.defaults.items():
         if field.name in data or field in data: continue
-        value = default() if callable_(default) else default
+        value = default() if callable(default) else default
         data[field] = value
     fields, values = zip(*data.items())
     sq = Select(columns=values).where(where)
@@ -230,10 +229,17 @@ class ReconnectMixin(object):
         (OperationalError, '2013'),  # Lost connection to MySQL server.
         (OperationalError, '2014'),  # Commands out of sync.
         (OperationalError, '4031'),  # Client interaction timeout.
+        (InterfaceError, "(0, '')"),  # Dead connection reused (pymysql).
 
         # mysql-connector raises a slightly different error when an idle
         # connection is terminated by the server. This is equivalent to 2013.
         (OperationalError, 'MySQL Connection not available.'),
+
+        # Postgres error examples:
+        #(OperationalError, 'server closed the connection'),  # psycopg2.
+        #(InterfaceError, 'connection already closed'),  # psycopg2.
+        #(OperationalError, 'terminating connection'),  # psycopg3.
+        #(OperationalError, 'the connection is closed'),  # psycopg3.
     )
 
     def __init__(self, *args, **kwargs):
@@ -245,10 +251,23 @@ class ReconnectMixin(object):
             self._reconnect_errors.setdefault(exc_class, [])
             self._reconnect_errors[exc_class].append(err_fragment.lower())
 
-    def execute_sql(self, sql, params=None, commit=SENTINEL):
+    def execute_sql(self, sql, params=None):
+        return self._reconnect(super(ReconnectMixin, self).execute_sql,
+                               sql, params)
+
+    def begin(self, *args, **kwargs):
+        return self._reconnect(super(ReconnectMixin, self).begin,
+                               *args, **kwargs)
+
+    def _reconnect(self, func, *args, **kwargs):
         try:
-            return super(ReconnectMixin, self).execute_sql(sql, params, commit)
+            return func(*args, **kwargs)
         except Exception as exc:
+            # If we are in a transaction, do not reconnect silently as
+            # any changes could be lost.
+            if self.in_transaction():
+                raise exc
+
             exc_class = type(exc)
             if exc_class not in self._reconnect_errors:
                 raise exc
@@ -264,7 +283,7 @@ class ReconnectMixin(object):
                 self.close()
                 self.connect()
 
-            return super(ReconnectMixin, self).execute_sql(sql, params, commit)
+            return func(*args, **kwargs)
 
 
 def resolve_multimodel_query(query, key='_model_identifier'):
@@ -279,7 +298,7 @@ def resolve_multimodel_query(query, key='_model_identifier'):
         model_class = curr.model
         name = model_class._meta.table_name
         mapping[name] = model_class
-        curr._returning.append(Value(name).alias(key))
+        curr._returning = tuple(curr._returning) + (Value(name).alias(key),)
 
     def wrapped_iterator():
         for row in query.dicts().iterator():
@@ -302,6 +321,8 @@ class ThreadSafeDatabaseMetadata(Metadata):
     def __init__(self, *args, **kwargs):
         # The database attribute is stored in a thread-local.
         self._database = None
+        self._table = None
+        self._lock = threading.Lock()
         self._local = threading.local()
         super(ThreadSafeDatabaseMetadata, self).__init__(*args, **kwargs)
 
@@ -312,3 +333,20 @@ class ThreadSafeDatabaseMetadata(Metadata):
             self._database = db
         self._local.database = db
     database = property(_get_db, _set_db)
+
+    def set_database(self, database):
+        with self._lock:
+            return super(ThreadSafeDatabaseMetadata,
+                         self).set_database(database)
+
+    @property
+    def table(self):
+        if getattr(self._local, 'table', None) is None:
+            self._local.table = super(ThreadSafeDatabaseMetadata, self).table
+        return self._local.table
+    @table.setter
+    def table(self, value):
+        raise AttributeError('Cannot set the "table".')
+    @table.deleter
+    def table(self):
+        self._local.table = None

@@ -1,8 +1,6 @@
 import os
-import sys
 import threading
 import time
-import unittest
 from functools import partial
 
 try:
@@ -19,11 +17,12 @@ from playhouse.sqliteq import WriterPaused
 from .base import BaseTestCase
 from .base import TestModel
 from .base import db_loader
+from .base import get_sqlite_db
 from .base import skip_if
 
 
 get_db = partial(db_loader, 'sqlite', db_class=SqliteQueueDatabase)
-db = db_loader('sqlite')
+db = get_sqlite_db()
 
 
 class User(TestModel):
@@ -150,6 +149,11 @@ class BaseTestQueueDatabase(object):
 
         self.database.stop()
 
+    def test_stop_returns_true(self):
+        self.database.start()
+        User.create(name='a')
+        self.assertTrue(self.database.stop())
+
     def test_restart(self):
         self.database.start()
         User.create(name='a')
@@ -234,8 +238,9 @@ class TestThreadedDatabaseThreads(BaseTestQueueDatabase, BaseTestCase):
         # will cause the query results to time-out.
         self.database._results_timeout = 0.001
         def do_query():
-            cursor = self.database.execute_sql('select slow(?)', (0.01,),
-                                               commit=True)
+            # Prepend a space so that we can force it through the threaded
+            # pipeline, otherwise it would execute normally.
+            cursor = self.database.execute_sql(' select slow(?)', (0.01,))
             self.assertEqual(cursor.fetchone()[0], 'slept 0.01')
 
         self.assertRaises(ResultTimeout, do_query)

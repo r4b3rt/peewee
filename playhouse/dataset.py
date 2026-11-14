@@ -1,39 +1,27 @@
+import base64
 import csv
 import datetime
-from decimal import Decimal
 import json
 import operator
-try:
-    from urlparse import urlparse
-except ImportError:
-    from urllib.parse import urlparse
-import sys
 import uuid
+from decimal import Decimal
+from functools import reduce
+from urllib.parse import urlparse
 
 from peewee import *
+from peewee import _StringField
 from playhouse.db_url import connect
 from playhouse.migrate import migrate
 from playhouse.migrate import SchemaMigrator
 from playhouse.reflection import Introspector
 
-if sys.version_info[0] == 3:
-    basestring = str
-    from functools import reduce
-    def open_file(f, mode, encoding='utf8'):
-        return open(f, mode, encoding=encoding)
-else:
-    def open_file(f, mode, encoding='utf8'):
-        return open(f, mode)
-
 
 class DataSet(object):
     def __init__(self, url, include_views=False, **kwargs):
         if isinstance(url, Database):
-            self._url = None
             self._database = url
             self._database_path = self._database.database
         else:
-            self._url = url
             parse_result = urlparse(url)
             self._database_path = parse_result.path[1:]
 
@@ -46,11 +34,12 @@ class DataSet(object):
         # Introspect the database and generate models.
         self._introspector = Introspector.from_database(self._database)
         self._include_views = include_views
+        self._model_kwargs = kwargs
         self._models = self._introspector.generate_models(
             skip_invalid=True,
             literal_column_names=True,
             include_views=self._include_views,
-            **kwargs)
+            **self._model_kwargs)
         self._migrator = SchemaMigrator.from_database(self._database)
 
         class BaseModel(Model):
@@ -117,7 +106,8 @@ class DataSet(object):
             skip_invalid=True,
             table_names=dependencies,
             literal_column_names=True,
-            include_views=self._include_views)
+            include_views=self._include_views,
+            **self._model_kwargs)
         self._models.update(updated)
 
     def get_table_dependencies(self, table):
@@ -129,6 +119,7 @@ class DataSet(object):
             for fk_meta in self._database.get_foreign_keys(table):
                 dest = fk_meta.dest_table
                 if dest not in seen:
+                    seen.add(dest)
                     stack.append(dest)
                     accum.append(dest)
         return accum
@@ -141,8 +132,8 @@ class DataSet(object):
         if not self._database.is_closed():
             self.close()
 
-    def query(self, sql, params=None, commit=True):
-        return self._database.execute_sql(sql, params, commit)
+    def query(self, sql, params=None):
+        return self._database.execute_sql(sql, params)
 
     def transaction(self):
         return self._database.atomic()
@@ -160,24 +151,35 @@ class DataSet(object):
                 format, valid_formats))
 
     def freeze(self, query, format='csv', filename=None, file_obj=None,
-               encoding='utf8', **kwargs):
+               encoding='utf8', iso8601_datetimes=False, base64_bytes=False,
+               **kwargs):
         self._check_arguments(filename, file_obj, format, self._export_formats)
         if filename:
-            file_obj = open_file(filename, 'w', encoding)
+            file_obj = open(filename, 'w', encoding=encoding)
 
-        exporter = self._export_formats[format](query)
+        exporter = self._export_formats[format](
+            query,
+            iso8601_datetimes=iso8601_datetimes,
+            base64_bytes=base64_bytes)
+
         exporter.export(file_obj, **kwargs)
 
         if filename:
             file_obj.close()
 
     def thaw(self, table, format='csv', filename=None, file_obj=None,
-             strict=False, encoding='utf8', **kwargs):
-        self._check_arguments(filename, file_obj, format, self._export_formats)
+             strict=False, encoding='utf8', iso8601_datetimes=False,
+             base64_bytes=False, **kwargs):
+        self._check_arguments(filename, file_obj, format, self._import_formats)
         if filename:
-            file_obj = open_file(filename, 'r', encoding)
+            file_obj = open(filename, 'r', encoding=encoding)
 
-        importer = self._import_formats[format](self[table], strict)
+        importer = self._import_formats[format](
+            self[table],
+            strict=strict,
+            iso8601_datetimes=iso8601_datetimes,
+            base64_bytes=base64_bytes)
+
         count = importer.load(file_obj, **kwargs)
 
         if filename:
@@ -222,7 +224,7 @@ class Table(object):
         self.dataset._database.execute(index)
 
     def _guess_field_type(self, value):
-        if isinstance(value, basestring):
+        if isinstance(value, str):
             return TextField
         if isinstance(value, (datetime.date, datetime.datetime)):
             return DateTimeField
@@ -242,6 +244,7 @@ class Table(object):
 
     def _migrate_new_columns(self, data):
         new_keys = set(data) - set(self.model_class._meta.fields)
+        new_keys -= set(self.model_class._meta.columns)
         if new_keys:
             operations = []
             for key in new_keys:
@@ -329,33 +332,36 @@ class Table(object):
 
 
 class Exporter(object):
-    def __init__(self, query):
+    def __init__(self, query, iso8601_datetimes=False, base64_bytes=False):
         self.query = query
+        self.iso8601_datetimes = iso8601_datetimes
+        self.base64_bytes = base64_bytes
+
+    def _export_value(self, value):
+        if isinstance(value, _datetime_types):
+            return value.isoformat() if self.iso8601_datetimes else str(value)
+        elif isinstance(value, (Decimal, uuid.UUID)):
+            return str(value)
+        elif isinstance(value, bytes):
+            if self.base64_bytes:
+                return base64.urlsafe_b64encode(value).decode('utf8')
+            return value.hex()
+        return value
 
     def export(self, file_obj):
         raise NotImplementedError
 
 
+_datetime_types = (datetime.datetime, datetime.date, datetime.time)
+
+
 class JSONExporter(Exporter):
-    def __init__(self, query, iso8601_datetimes=False):
-        super(JSONExporter, self).__init__(query)
-        self.iso8601_datetimes = iso8601_datetimes
-
     def _make_default(self):
-        datetime_types = (datetime.datetime, datetime.date, datetime.time)
-
-        if self.iso8601_datetimes:
-            def default(o):
-                if isinstance(o, datetime_types):
-                    return o.isoformat()
-                elif isinstance(o, (Decimal, uuid.UUID)):
-                    return str(o)
+        def default(o):
+            value = self._export_value(o)
+            if value is o:
                 raise TypeError('Unable to serialize %r as JSON' % o)
-        else:
-            def default(o):
-                if isinstance(o, datetime_types + (Decimal, uuid.UUID)):
-                    return str(o)
-                raise TypeError('Unable to serialize %r as JSON' % o)
+            return value
         return default
 
     def export(self, file_obj, **kwargs):
@@ -374,7 +380,7 @@ class CSVExporter(Exporter):
         if header and getattr(tuples, 'columns', None):
             writer.writerow([column for column in tuples.columns])
         for row in tuples:
-            writer.writerow(row)
+            writer.writerow([self._export_value(value) for value in row])
 
 
 class TSVExporter(CSVExporter):
@@ -384,13 +390,30 @@ class TSVExporter(CSVExporter):
 
 
 class Importer(object):
-    def __init__(self, table, strict=False):
+    def __init__(self, table, strict=False, iso8601_datetimes=False,
+                 base64_bytes=False):
         self.table = table
         self.strict = strict
+        self.iso8601_datetimes = iso8601_datetimes
+        self.base64_bytes = base64_bytes
 
         model = self.table.model_class
-        self.columns = model._meta.columns
+        self.columns = dict(model._meta.columns)
         self.columns.update(model._meta.fields)
+
+    def _import_value(self, field, value):
+        if value is None:
+            return value
+        if isinstance(field, DateTimeField) and self.iso8601_datetimes:
+            value = datetime.datetime.fromisoformat(value)
+        elif isinstance(field, DateField) and self.iso8601_datetimes:
+            value = datetime.date.fromisoformat(value)
+        elif isinstance(field, BlobField):
+            if self.base64_bytes:
+                value = base64.urlsafe_b64decode(value.encode('utf8'))
+            else:
+                value = bytes.fromhex(value)
+        return field.python_value(value)
 
     def load(self, file_obj):
         raise NotImplementedError
@@ -402,14 +425,13 @@ class JSONImporter(Importer):
         count = 0
 
         for row in data:
-            if self.strict:
-                obj = {}
-                for key in row:
-                    field = self.columns.get(key)
-                    if field is not None:
-                        obj[field.name] = field.python_value(row[key])
-            else:
-                obj = row
+            obj = {}
+            for key in row:
+                field = self.columns.get(key)
+                if field is not None:
+                    obj[key] = self._import_value(field, row[key])
+                elif not self.strict:
+                    obj[key] = row[key]
 
             if obj:
                 self.table.insert(**obj)
@@ -422,32 +444,37 @@ class CSVImporter(Importer):
     def load(self, file_obj, header=True, **kwargs):
         count = 0
         reader = csv.reader(file_obj, **kwargs)
+
+        header_fields = []
         if header:
             try:
                 header_keys = next(reader)
             except StopIteration:
                 return count
 
-            if self.strict:
-                header_fields = []
-                for idx, key in enumerate(header_keys):
-                    if key in self.columns:
-                        header_fields.append((idx, self.columns[key]))
-            else:
-                header_fields = list(enumerate(header_keys))
+            for idx, key in enumerate(header_keys):
+                if key in self.columns or not self.strict:
+                    header_fields.append((idx, key, self.columns.get(key)))
         else:
-            header_fields = list(enumerate(self.model._meta.sorted_fields))
+            fields = self.table.model_class._meta.sorted_fields
+            for idx, field in enumerate(fields):
+                header_fields.append((idx, field.name, field))
 
         if not header_fields:
             return count
 
         for row in reader:
             obj = {}
-            for idx, field in header_fields:
-                if self.strict:
-                    obj[field.name] = field.python_value(row[idx])
-                else:
-                    obj[field] = row[idx]
+            for idx, name, field in header_fields:
+                value = row[idx]
+                if field is None:
+                    obj[name] = value
+                    continue
+
+                # CSV has no null, treat empty as NULL for non-text fields.
+                if value == '' and not isinstance(field, _StringField):
+                    value = None
+                obj[field.name] = self._import_value(field, value)
 
             self.table.insert(**obj)
             count += 1

@@ -1,23 +1,23 @@
 #coding:utf-8
 import datetime
-import functools
+import json
+import os
 import uuid
 from decimal import Decimal as Dc
-from types import MethodType
 
 from peewee import *
+from peewee import Psycopg3Adapter
 from playhouse.postgres_ext import *
+from playhouse.reflection import Introspector
 
 from .base import BaseTestCase
-from .base import DatabaseTestCase
 from .base import ModelTestCase
 from .base import TestModel
 from .base import db_loader
 from .base import requires_models
+from .base import skip_if
 from .base import skip_unless
 from .base_models import Register
-from .base_models import Tweet
-from .base_models import User
 from .postgres_helpers import BaseBinaryJsonFieldTestCase
 from .postgres_helpers import BaseJsonFieldTestCase
 
@@ -57,22 +57,33 @@ class FTSModel(TestModel):
     fts_data = TSVectorField()
 
 
-try:
-    class JsonModel(TestModel):
-        data = JSONField()
+class JsonModel(TestModel):
+    data = JSONField()
 
-    class JsonModelNull(TestModel):
-        data = JSONField(null=True)
+class JsonModelNull(TestModel):
+    data = JSONField(null=True)
 
-    class BJson(TestModel):
-        data = BinaryJSONField()
+class BJson(TestModel):
+    data = BinaryJSONField()
 
-    class JData(TestModel):
-        d1 = BinaryJSONField()
-        d2 = BinaryJSONField()
-except:
-    BJson = JData = None
-    JsonModel = JsonModelNull = None
+class JData(TestModel):
+    d1 = BinaryJSONField()
+    d2 = BinaryJSONField(index=False)
+
+
+class UUIDEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, uuid.UUID):
+            return str(obj)
+        return super(UUIDEncoder, self).default(obj)
+
+def dumps(obj):
+    return json.dumps(obj, cls=UUIDEncoder)
+
+
+class CustomJSONDumps(TestModel):
+    jf = JSONField(dumps=dumps)
+    jbf = BinaryJSONField(dumps=dumps)
 
 
 class Normal(TestModel):
@@ -92,15 +103,16 @@ class TestTZField(ModelTestCase):
     database = db
     requires = [TZModel]
 
+    @skip_if(os.environ.get('CI'), 'running in ci mode, skipping')
     def test_tz_field(self):
-        self.database.set_time_zone('us/eastern')
+        self.database.set_time_zone('America/New_York')
 
         # Our naive datetime is treated as if it were in US/Eastern.
         dt = datetime.datetime(2019, 1, 1, 12)
         tz = TZModel.create(dt=dt)
         self.assertTrue(tz.dt.tzinfo is None)
 
-        # When we retrieve the row, psycopg2 will attach the appropriate tzinfo
+        # When we retrieve the row, psycopg will attach the appropriate tzinfo
         # data. The value is returned as an "aware" datetime in US/Eastern.
         tz_db = TZModel[tz.id]
         self.assertTrue(tz_db.dt.tzinfo is not None)
@@ -130,7 +142,7 @@ class TestTZField(ModelTestCase):
         self.assertEqual(tzq2.id, tz2.id)
 
         # Change the connection timezone?
-        self.database.set_time_zone('us/central')
+        self.database.set_time_zone('America/Chicago')
         tz_db = TZModel[tz.id]
         self.assertEqual(tz_db.dt.timetuple()[:4], (2019, 1, 1, 11))
         self.assertEqual(tz_db.dt.utctimetuple()[:4], (2019, 1, 1, 17))
@@ -390,13 +402,22 @@ class TestArrayField(ModelTestCase):
         row = AM.select(T[1].alias('arrtags')).dicts().get()
         self.assertEqual(row['arrtags'], 'beta')
 
+        row = AM.select(T[2:3].alias('foo')).dicts().get()
+        self.assertEqual(row['foo'], ['gamma'])
+
+        row = AM.select(T[:2].alias('foo')).dicts().get()
+        self.assertEqual(row['foo'], ['alpha', 'beta'])
+
+        row = AM.select(T[2:].alias('foo')).dicts().get()
+        self.assertEqual(row['foo'], ['gamma', 'delta'])
+
         row = AM.select(T[2:4].alias('foo')).dicts().get()
         self.assertEqual(row['foo'], ['gamma', 'delta'])
 
         row = AM.select(I[1][1].alias('ints')).dicts().get()
         self.assertEqual(row['ints'], 4)
 
-        row = AM.select(I[1:2][0].alias('ints')).dicts().get()
+        row = AM.select(I[1:3][0].alias('ints')).dicts().get()
         self.assertEqual(row['ints'], [[3], [5]])
 
     @requires_models(DecimalArray)
@@ -469,11 +490,6 @@ class TestArrayUUIDField(ModelTestCase):
     database = db
     requires = [UUIDList]
 
-    def setUp(self):
-        super(TestArrayUUIDField, self).setUp()
-        import psycopg2.extras
-        psycopg2.extras.register_uuid()
-
     def test_array_of_uuids(self):
         u1, u2, u3, u4 = [uuid.uuid4() for _ in range(4)]
         a = UUIDList.create(key='a', id_list=[u1, u2, u3],
@@ -521,6 +537,14 @@ class TestTSVectorField(ModelTestCase):
             'FROM "fts_model" AS "t1" '
             'WHERE (to_tsvector("t1"."data") @@ to_tsquery(?))'), ['foo bar'])
 
+        query = FTSModel.select().where(
+            Match(FTSModel.data, 'foo bar', websearch=True))
+        self.assertSQL(query, (
+            'SELECT "t1"."id", "t1"."title", "t1"."data", "t1"."fts_data" '
+            'FROM "fts_model" AS "t1" '
+            'WHERE (to_tsvector("t1"."data") @@ websearch_to_tsquery(?))'),
+            ['foo bar'])
+
     def test_match_function(self):
         D = FTSModel.data
         self.assertMessages(Match(D, 'heart'), [1])
@@ -548,23 +572,19 @@ class TestTSVectorField(ModelTestCase):
         self.assertMessages(M('thing', plain=True), [2, 4])
         self.assertMessages(M('faith things', plain=True), [2, 4])
 
+        # websearch handles raw user input: quoted phrases, "or", negation.
+        self.assertMessages(M('god or things', websearch=True), [1, 2, 4])
+        self.assertMessages(M('faith -things', websearch=True), [0, 1, 3])
+        self.assertMessages(M('"small things"', websearch=True), [2])
+        self.assertMessages(M('&&&! ()', websearch=True), [])
+        self.assertRaises(ValueError, M, 'x', plain=True, websearch=True)
 
-def pg93():
-    with db:
-        return db.connection().server_version >= 90300
-
-def pg10():
-    with db:
-        return db.connection().server_version >= 100000
 
 def pg12():
     with db:
-        return db.connection().server_version >= 120000
-
-JSON_SUPPORT = (JsonModel is not None) and pg93()
+        return db.server_version >= 120000
 
 
-@skip_unless(JSON_SUPPORT, 'json support unavailable')
 class TestJsonField(BaseJsonFieldTestCase, ModelTestCase):
     M = JsonModel
     N = Normal
@@ -585,14 +605,12 @@ class TestJsonField(BaseJsonFieldTestCase, ModelTestCase):
         self.assertEqual(query.get(), tjn)
 
 
-@skip_unless(JSON_SUPPORT, 'json support unavailable')
 class TestBinaryJsonField(BaseBinaryJsonFieldTestCase, ModelTestCase):
     M = BJson
     N = Normal
     database = db
     requires = [BJson, Normal]
 
-    @skip_unless(pg10(), 'jsonb remove support requires pg >= 10')
     def test_remove_data(self):
         BJson.delete().execute()  # Clear out db.
         BJson.create(data={
@@ -612,7 +630,276 @@ class TestBinaryJsonField(BaseBinaryJsonFieldTestCase, ModelTestCase):
         assertData(['k1', 'kx', 'ky', 'k3'], {'k2': 'v2', 'k4': [0, 1, 2]})
         assertData(['k4', 'k3'], {'k1': 'v1', 'k2': 'v2'})
 
-    @skip_unless(pg10(), 'jsonb remove support requires pg >= 10')
+    def test_remove_path(self):
+        BJson.delete().execute()  # Clear out db.
+        data = {'k1': {'x1': {'y1': 'z1', 'y2': 'z2'}, 'x2': ['i1', 'i2']}}
+        BJson.create(data=data)
+
+        def assertData(exp_list, expected_data):
+            curr = BJson.data
+            for exp in exp_list:
+                curr = curr[exp]
+
+            query = BJson.select(curr.remove()).tuples()
+            data = query[:][0][0]
+            self.assertEqual(data, expected_data)
+
+        assertData(['k1'], {})
+
+        assertData(['k1', 'x1'], {'k1': {'x2': ['i1', 'i2']}})
+
+        assertData(['k1', 'x1', 'y1'],
+                   {'k1': {'x1': {'y2': 'z2'}, 'x2': ['i1', 'i2']}})
+        assertData(['k1', 'x1', 'y2'],
+                   {'k1': {'x1': {'y1': 'z1'}, 'x2': ['i1', 'i2']}})
+
+        assertData(['k1', 'x2', 0],
+                   {'k1': {'x1': {'y1': 'z1', 'y2': 'z2'}, 'x2': ['i2']}})
+        assertData(['k1', 'x2', -1],
+                   {'k1': {'x1': {'y1': 'z1', 'y2': 'z2'}, 'x2': ['i1']}})
+
+        assertData(['kx'], data)
+        assertData(['k1', 'zz'], data)
+
+    def test_lookup_path_chain(self):
+        BJson.delete().execute()
+        BJson.create(data={'k1': {'x1': {'y1': 'z1'}, 'x2': [0, 1]}})
+
+        base = BJson.data['k1']
+        def select(expr):
+            return BJson.select(expr).tuples()[:][0][0]
+
+        # .path() chained onto a lookup resolves to the full path, rather than
+        # crashing (contains/contained_by/concat) or clobbering the whole
+        # column (remove).
+        self.assertEqual(select(base.path('x1', 'y1').remove()),
+                         {'k1': {'x1': {}, 'x2': [0, 1]}})
+        self.assertEqual(
+            BJson.select().where(base.path('x1').contains({'y1': 'z1'})).count(),
+            1)
+        self.assertEqual(
+            BJson.select().where(
+                base.path('x1').contained_by({'y1': 'z1', 'y2': 'z2'})).count(),
+            1)
+        self.assertEqual(select(base.path('x1').concat({'y2': 'z2'})),
+                         {'y1': 'z1', 'y2': 'z2'})
+
+    def test_lookup_set(self):
+        BJson.delete().execute()
+        BJson.create(data={'a': 1, 'b': {'x': 1}})
+
+        def select(expr):
+            return BJson.select(expr).tuples()[:][0][0]
+
+        # Replace existing nested key.
+        self.assertEqual(select(BJson.data['a'].set(99)),
+                         {'a': 99, 'b': {'x': 1}})
+        # Create missing key (jsonb_set with create_missing=true).
+        self.assertEqual(select(BJson.data['c'].set('x')),
+                         {'a': 1, 'b': {'x': 1}, 'c': 'x'})
+        # Set with a nested dict value.
+        self.assertEqual(select(BJson.data['b']['y'].set({'z': 2})),
+                         {'a': 1, 'b': {'x': 1, 'y': {'z': 2}}})
+
+    def test_lookup_replace(self):
+        BJson.delete().execute()
+        BJson.create(data={'a': 1, 'b': 2})
+
+        def select(expr):
+            return BJson.select(expr).tuples()[:][0][0]
+
+        # Existing key gets replaced.
+        self.assertEqual(select(BJson.data['a'].replace(99)),
+                         {'a': 99, 'b': 2})
+        # Missing key, replace is a no-op (create_missing=false).
+        self.assertEqual(select(BJson.data['c'].replace(7)), {'a': 1, 'b': 2})
+
+    def test_lookup_insert(self):
+        BJson.delete().execute()
+        BJson.create(data={'a': 1, 'b': 2})
+
+        def select(expr):
+            return BJson.select(expr).tuples()[:][0][0]
+
+        # Missing key - value gets inserted.
+        self.assertEqual(select(BJson.data['c'].insert(7)),
+                         {'a': 1, 'b': 2, 'c': 7})
+        # Existing key - insert is a no-op.
+        self.assertEqual(select(BJson.data['a'].insert(99)), {'a': 1, 'b': 2})
+
+    def test_lookup_append(self):
+        BJson.delete().execute()
+        BJson.create(data={'arr': [1, 2, 3]})
+
+        def select(expr):
+            return BJson.select(expr).tuples()[:][0][0]
+
+        self.assertEqual(select(BJson.data['arr'].append(4)),
+                         {'arr': [1, 2, 3, 4]})
+        # Append a non-scalar.
+        self.assertEqual(select(BJson.data['arr'].append({'x': 1})),
+                         {'arr': [1, 2, 3, {'x': 1}]})
+
+    def test_lookup_update(self):
+        BJson.delete().execute()
+        BJson.create(data={'a': 1, 'b': {'x': 1}})
+
+        def select(expr):
+            return BJson.select(expr).tuples()[:][0][0]
+
+        # Shallow merge new keys into a nested object.
+        self.assertEqual(select(BJson.data['b'].update({'y': 2})),
+                         {'a': 1, 'b': {'x': 1, 'y': 2}})
+        # Existing keys get overwritten by the merged value (shallow).
+        self.assertEqual(select(BJson.data['b'].update({'x': 9, 'z': 3})),
+                         {'a': 1, 'b': {'x': 9, 'z': 3}})
+
+    def test_field_append_update(self):
+        # Root-level append (when the document is an array).
+        BJson.delete().execute()
+        BJson.create(data=[1, 2, 3])
+        result = BJson.select(BJson.data.append(4)).tuples()[:][0][0]
+        self.assertEqual(result, [1, 2, 3, 4])
+
+        # Root-level update (shallow merge into the root object).
+        BJson.delete().execute()
+        BJson.create(data={'a': 1})
+        result = BJson.select(BJson.data.update({'b': 2})).tuples()[:][0][0]
+        self.assertEqual(result, {'a': 1, 'b': 2})
+
+    def test_mutation_persists_through_update(self):
+        # Verify the builders work in an UPDATE statement, not just SELECT.
+        BJson.delete().execute()
+        bj = BJson.create(data={'a': 1})
+        BJson.update({BJson.data: BJson.data['b'].set('x')}).execute()
+        BJson.update({BJson.data: BJson.data['arr'].set([0, 1])}).execute()
+        BJson.update({BJson.data: BJson.data['arr'].append(2)}).execute()
+        bj = BJson.get(BJson.id == bj.id)
+        self.assertEqual(bj.data, {'a': 1, 'b': 'x', 'arr': [0, 1, 2]})
+
+    @skip_unless(pg12(), 'requires Postgres 12+ for jsonpath support')
+    def test_path_exists(self):
+        BJson.delete().execute()
+        a = BJson.create(data={'foo': [1, 5, 10]})
+        b = BJson.create(data={'foo': [1, 2]})
+        c = BJson.create(data={'bar': 'x'})
+
+        # Path matches at least one element with @ > 4.
+        q = BJson.select().where(BJson.data.path_exists('$.foo[*] ? (@ > 4)'))
+        self.assertEqual([m.id for m in q], [a.id])
+
+        # Plain key existence.
+        q = BJson.select().where(BJson.data.path_exists('$.foo'))
+        self.assertEqual(sorted(m.id for m in q), sorted([a.id, b.id]))
+
+    @skip_unless(pg12(), 'requires Postgres 12+ for jsonpath support')
+    def test_path_match(self):
+        BJson.delete().execute()
+        a = BJson.create(data={'n': 10})
+        b = BJson.create(data={'n': 1})
+
+        q = BJson.select().where(BJson.data.path_match('$.n > 5'))
+        self.assertEqual([m.id for m in q], [a.id])
+
+    @skip_unless(pg12(), 'requires Postgres 12+ for jsonpath support')
+    def test_path_query_array(self):
+        BJson.delete().execute()
+        BJson.create(data={'items': [
+            {'name': 'a', 'qty': 1},
+            {'name': 'b', 'qty': 5},
+            {'name': 'c', 'qty': 3}]})
+
+        # All names with qty > 2.
+        q = BJson.select(BJson.data.path_query_array(
+            '$.items[*] ? (@.qty > 2).name'))
+        self.assertEqual(q.tuples()[:][0][0], ['b', 'c'])
+
+    @skip_unless(pg12(), 'requires Postgres 12+ for jsonpath support')
+    def test_path_query_first(self):
+        BJson.delete().execute()
+        BJson.create(data={'items': [{'qty': 1}, {'qty': 5}, {'qty': 3}]})
+
+        q = BJson.select(BJson.data.path_query_first(
+            '$.items[*] ? (@.qty > 2).qty'))
+        self.assertEqual(q.tuples()[:][0][0], 5)
+
+    @skip_unless(pg12(), 'requires Postgres 12+ for jsonpath support')
+    def test_path_query_srf(self):
+        # path_query returns a set-returning function. Postgres expands it into
+        # multiple rows when it appears in SELECT.
+        BJson.delete().execute()
+        BJson.create(data={'tags': ['a', 'b', 'c']})
+
+        q = BJson.select(BJson.data.path_query('$.tags[*]').alias('tag'))
+        self.assertEqual(sorted(r[0] for r in q.tuples()), ['a', 'b', 'c'])
+
+    @skip_unless(pg12(), 'requires Postgres 12+ for jsonpath support')
+    def test_path_ops_on_lookup(self):
+        # path_* operators are also exposed on _JsonLookupBase so they can
+        # target a sub-document rather than the whole field.
+        BJson.delete().execute()
+        a = BJson.create(data={'users': [
+            {'name': 'alice', 'role': 'admin'},
+            {'name': 'bob'}]})
+        BJson.create(data={'users': [{'name': 'carol'}]})
+
+        q = BJson.select().where(
+            BJson.data['users'].path_exists('$[*] ? (@.role == "admin")'))
+        self.assertEqual([m.id for m in q], [a.id])
+
+        q = BJson.select().where(
+            BJson.data['users'].path_match('$[*].role == "admin"'))
+        self.assertEqual([m.id for m in q], [a.id])
+
+        q = (BJson
+             .select(BJson.data['users'].path_query_array('$[*].name'))
+             .where(BJson.id == a.id))
+        self.assertEqual(q.tuples()[:][0][0], ['alice', 'bob'])
+
+    def test_json_length(self):
+        BJson.delete().execute()  # Clear out db.
+        data = {'k1': {'x1': [1, 2, 3], 'x2': [1, 2], 'x3': []}}
+        BJson.create(data=data)
+
+        def assertLength(exp_list, count):
+            curr = BJson.data
+            for exp in exp_list:
+                curr = curr[exp]
+
+            query = BJson.select(curr.length()).tuples()
+            data = query[:][0][0]
+            self.assertEqual(data, count)
+
+        assertLength(('k1', 'x1'), 3)
+        assertLength(('k1', 'x2'), 2)
+        assertLength(('k1', 'x3'), 0)
+
+        BJson.delete().execute()  # Clear out db.
+        BJson.create(data=[0, 1, 2, 3, 4, 5])
+        assertLength((), 6)
+
+    def test_json_extract(self):
+        BJson.delete().execute()  # Clear out db.
+        data = {'k1': {'x1': {'y1': 'z1', 'y2': 'z2'}, 'x2': ['i1', 'i2']}}
+        BJson.create(data=data)
+
+        def assertData(node, path, expected_data):
+            query = BJson.select(node.extract(*path)).tuples()
+            data = query[:][0][0]
+            self.assertEqual(data, expected_data)
+
+        assertData(BJson.data, ('k1', 'x1', 'y1'), 'z1')
+        assertData(BJson.data, ('k1', 'x1'), {'y1': 'z1', 'y2': 'z2'})
+        assertData(BJson.data, ('k1', 'x2', 0), 'i1')
+        assertData(BJson.data, ('k1', 'x2', -1), 'i2')
+        assertData(BJson.data, ('k1',),
+                   {'x1': {'y1': 'z1', 'y2': 'z2'}, 'x2': ['i1', 'i2']})
+        assertData(BJson.data, ('kx',), None)
+
+        assertData(BJson.data['k1'], ('x1', 'y1'), 'z1')
+        assertData(BJson.data['k1']['x1'], ('y1',), 'z1')
+        assertData(BJson.data['k1']['x2'], (0,), 'i1')
+
     def test_json_contains_in_list(self):
         m1 = self.M.create(data=[{'k1': 'v1', 'k2': 'v2'}, {'a1': 'b1'}])
         m2 = self.M.create(data=[{'k3': 'v3'}, {'k4': 'v4'}])
@@ -637,25 +924,26 @@ class TestBinaryJsonField(BaseBinaryJsonFieldTestCase, ModelTestCase):
         self.assertRaises(ProgrammingError, fails)
 
 
-@skip_unless(JSON_SUPPORT, 'json support unavailable')
-class TestBinaryJsonFieldBulkUpdate(ModelTestCase):
-    database = db
-    requires = [BJson]
+class Point(object):
+    def __init__(self, x, y):
+        self.x, self.y = x, y
+    def __eq__(self, other):
+        return (self.x, self.y) == (other.x, other.y)
 
-    def test_binary_json_field_bulk_update(self):
-        b1 = BJson.create(data={'k1': 'v1'})
-        b2 = BJson.create(data={'k2': 'v2'})
-        b1.data['k1'] = 'v1-x'
-        b2.data['k2'] = 'v2-y'
-        BJson.bulk_update([b1, b2], fields=[BJson.data])
+class CustomJsonField(BinaryJSONField):
+    def db_value(self, value):
+        if isinstance(value, Point):
+            value = {'x': value.x, 'y': value.y}
+        return super(CustomJsonField, self).db_value(value)
+    def python_value(self, value):
+        if value is not None:
+            return Point(**value)
 
-        b1_db = BJson.get(BJson.id == b1.id)
-        b2_db = BJson.get(BJson.id == b2.id)
-        self.assertEqual(b1_db.data, {'k1': 'v1-x'})
-        self.assertEqual(b2_db.data, {'k2': 'v2-y'})
+class CJM(TestModel):
+    name = TextField()
+    point = CustomJsonField()
 
 
-@skip_unless(JSON_SUPPORT, 'json support unavailable')
 class TestJsonFieldRegressions(ModelTestCase):
     database = db
     requires = [JData]
@@ -669,6 +957,62 @@ class TestJsonFieldRegressions(ModelTestCase):
         obj = query.get()
         self.assertEqual(obj.data, {
             'k1': {'x2': 'y2'}, 'k2': 'v2-x', 'k3': 'v3', 'k4': 'v4'})
+
+    def test_introspect_bjson_field(self):
+        introspector = Introspector.from_database(self.database)
+        models = introspector.generate_models(table_names=['j_data'])
+        JD = models['j_data']
+        self.assertEqual(JD._meta.sorted_field_names, ['id', 'd1', 'd2'])
+        self.assertTrue(isinstance(JD.d1, BinaryJSONField))
+        self.assertTrue(isinstance(JD.d2, BinaryJSONField))
+        self.assertTrue(JD.d1.index)
+        self.assertEqual(JD.d1.index_type, 'GIN')
+        self.assertFalse(JD.d2.index)
+
+    @requires_models(CJM)
+    def test_json_field_subclass(self):
+        c1 = CJM.create(name='c1', point=Point(1, 2))
+        c2 = CJM.insert(name='c2', point=Point(2, 3)).execute()
+
+        c1_db = CJM.get(CJM.name == 'c1')
+        c2_db = CJM.get(CJM.name == 'c2')
+        self.assertEqual(c1_db.point, Point(1, 2))
+        self.assertEqual(c2_db.point, Point(2, 3))
+
+        c2_db = CJM.select().where(CJM.point == Point(2, 3)).get()
+        self.assertEqual(c2_db.name, 'c2')
+
+        CJM.update(point=Point(3, 4)).where(CJM.point == Point(1, 2)).execute()
+        c1, c2 = CJM.select().order_by(CJM.name)
+        self.assertEqual(c1.point, Point(3, 4))
+        self.assertEqual(c2.point, Point(2, 3))
+
+        c1.point = Point(1.2, 2.5)
+        c1.save()
+        c1_db = CJM.get(CJM.name == 'c1')
+        self.assertEqual(c1_db.point, Point(1.2, 2.5))
+
+
+class TestJSONFieldCustomDumps(ModelTestCase):
+    database = db
+    requires = [CustomJSONDumps]
+
+    def test_custom_dumps(self):
+        u1 = uuid.uuid4()
+        u2 = uuid.uuid4()
+
+        data = {'u1': u1, 'u2': u2, 'u3': [u1, u2]}
+        c = CustomJSONDumps.create(jf=data, jbf=data)
+        c_db = CustomJSONDumps.get_by_id(c.id)
+
+        self.assertEqual(c_db.jf, {
+            'u1': str(u1),
+            'u2': str(u2),
+            'u3': [str(u1), str(u2)]})
+        self.assertEqual(c_db.jbf, {
+            'u1': str(u1),
+            'u2': str(u2),
+            'u3': [str(u1), str(u2)]})
 
 
 class TestIntervalField(ModelTestCase):
@@ -728,59 +1072,6 @@ class TestIndexedField(BaseTestCase):
              'USING MAGIC ("fake_index_with_type")')])
 
 
-class IDAlways(TestModel):
-    id = IdentityField(generate_always=True)
-    data = CharField()
-
-
-class IDByDefault(TestModel):
-    id = IdentityField()
-    data = CharField()
-
-
-@skip_unless(pg10(), 'identity field requires pg >= 10')
-class TestIdentityField(ModelTestCase):
-    database = db
-    requires = [IDAlways, IDByDefault]
-
-    def test_identity_field_always(self):
-        iq = IDAlways.insert_many([(d,) for d in ('d1', 'd2', 'd3')])
-        curs = iq.execute()
-        self.assertEqual(list(curs), [(1,), (2,), (3,)])
-
-        # Cannot specify id when generate always is true.
-        with self.assertRaises(ProgrammingError):
-            with self.database.atomic():
-                IDAlways.create(id=10, data='d10')
-
-        query = IDAlways.select().order_by(IDAlways.id)
-        self.assertEqual(list(query.tuples()), [
-            (1, 'd1'), (2, 'd2'), (3, 'd3')])
-
-    def test_identity_field_by_default(self):
-        iq = IDByDefault.insert_many([(d,) for d in ('d1', 'd2', 'd3')])
-        curs = iq.execute()
-        self.assertEqual(list(curs), [(1,), (2,), (3,)])
-
-        # Cannot specify id when generate always is true.
-        IDByDefault.create(id=10, data='d10')
-
-        query = IDByDefault.select().order_by(IDByDefault.id)
-        self.assertEqual(list(query.tuples()), [
-            (1, 'd1'), (2, 'd2'), (3, 'd3'), (10, 'd10')])
-
-    def test_schema(self):
-        sql, params = IDAlways._schema._create_table(False).query()
-        self.assertEqual(sql, (
-            'CREATE TABLE "id_always" ("id" INT GENERATED ALWAYS AS IDENTITY '
-            'NOT NULL PRIMARY KEY, "data" VARCHAR(255) NOT NULL)'))
-
-        sql, params = IDByDefault._schema._create_table(False).query()
-        self.assertEqual(sql, (
-            'CREATE TABLE "id_by_default" ("id" INT GENERATED BY DEFAULT AS '
-            'IDENTITY NOT NULL PRIMARY KEY, "data" VARCHAR(255) NOT NULL)'))
-
-
 class TestServerSide(ModelTestCase):
     database = db
     requires = [Register]
@@ -793,184 +1084,137 @@ class TestServerSide(ModelTestCase):
 
     def test_server_side_cursor(self):
         query = Register.select().order_by(Register.value)
+        with self.database.atomic():
+            with self.assertQueryCount(1):
+                data = [row.value for row in ServerSide(query)]
+                self.assertEqual(data, list(range(100)))
+
+            ss_query = ServerSide(query.limit(10), array_size=3)
+            self.assertEqual([row.value for row in ss_query], list(range(10)))
+
+            ss_query = ServerSide(query.where(SQL('1 = 0')))
+            self.assertEqual(list(ss_query), [])
+
+        # No transaction.
         with self.assertQueryCount(1):
             data = [row.value for row in ServerSide(query)]
             self.assertEqual(data, list(range(100)))
 
-        ss_query = ServerSide(query.limit(10), array_size=3)
-        self.assertEqual([row.value for row in ss_query], list(range(10)))
+    def test_server_side_query_hooks(self):
+        events = []
+        self.database.query_hooks.append(events.append)
+        try:
+            query = Register.select().order_by(Register.value)
+            data = [row.value for row in ServerSide(query)]
+            self.assertEqual(data, list(range(100)))
+            self.assertEqual(len(events), 1)
+            self.assertEqual(events[0].sql, (
+                'SELECT "t1"."id", "t1"."value" FROM "register" AS "t1" '
+                'ORDER BY "t1"."value"'))
+            self.assertIsNone(events[0].exception)
+        finally:
+            del self.database.query_hooks[:]
 
-        ss_query = ServerSide(query.where(SQL('1 = 0')))
-        self.assertEqual(list(ss_query), [])
+    def test_cursor_holdability(self):
+        is_psycopg3 = isinstance(self.database._adapter, Psycopg3Adapter)
+        query = Register.select().order_by(Register.value)
 
+        def is_holdable():
+            curs = self.database.execute_sql(
+                'select is_holdable from pg_cursors')
+            return curs.fetchone()[0]
 
-class KX(TestModel):
-    key = CharField(unique=True)
-    value = IntegerField()
-
-class TestAutocommitIntegration(ModelTestCase):
-    database = db
-    requires = [KX]
-
-    def setUp(self):
-        super(TestAutocommitIntegration, self).setUp()
+        # In a transaction psycopg3 scopes the cursor to it, psycopg2 always
+        # requires a holdable cursor.
         with self.database.atomic():
-            kx1 = KX.create(key='k1', value=1)
+            it = iter(ServerSide(query, array_size=10))
+            self.assertEqual(next(it).value, 0)
+            self.assertEqual(is_holdable(), not is_psycopg3)
+            self.assertEqual([r.value for r in it], list(range(1, 100)))
 
-    def force_integrity_error(self):
-        # Force an integrity error, then verify that the current
-        # transaction has been aborted.
-        self.assertRaises(IntegrityError, KX.create, key='k1', value=10)
-        self.assertRaises(InternalError, KX.get, key='k1')
+        # Without a transaction the server requires a holdable cursor.
+        it = iter(ServerSide(query, array_size=10))
+        self.assertEqual(next(it).value, 0)
+        self.assertTrue(is_holdable())
+        self.assertEqual([r.value for r in it], list(range(1, 100)))
 
-    def test_autocommit_default(self):
-        kx2 = KX.create(key='k2', value=2)  # Will be committed.
-        self.assertTrue(kx2.id > 0)
-        self.force_integrity_error()
-        self.database.rollback()
+    def test_lower_level_apis(self):
+        query = Register.select(Register.value).order_by(Register.value)
+        with self.database.atomic():
+            ssq = ServerSideQuery(query, array_size=10)
+            curs_wrapper = ssq._execute(self.database)
+            curs = curs_wrapper.cursor
+            self.assertTrue(isinstance(curs, FetchManyCursor))
+            self.assertEqual(curs.fetchone(), (0,))
+            self.assertEqual(curs.fetchone(), (1,))
+            curs.close()
 
-        self.assertEqual(KX.select().count(), 2)
-        self.assertEqual([(kx.key, kx.value)
-                          for kx in KX.select().order_by(KX.key)],
-                         [('k1', 1), ('k2', 2)])
+    def test_close_cursor(self):
+        query = Register.select(Register.value).order_by(Register.value)
+        with self.database.atomic():
+            ssq = ServerSideQuery(query, array_size=10)
+            accum = []
+            for i, obj in enumerate(ssq.iterator()):
+                if i == 25:
+                    break
+                accum.append(obj.value)
 
-    def test_autocommit_disabled(self):
-        with self.database.manual_commit():
-            kx2 = KX.create(key='k2', value=2)  # Not committed.
-            self.assertTrue(kx2.id > 0)  # Yes, we have a primary key.
-            self.force_integrity_error()
-            self.database.rollback()
+            self.assertTrue(ssq.close())
 
-        self.assertEqual(KX.select().count(), 1)
-        kx1_db = KX.get(KX.key == 'k1')
-        self.assertEqual(kx1_db.value, 1)
-
-    def test_atomic_block(self):
-        with self.database.atomic() as txn:
-            kx2 = KX.create(key='k2', value=2)
-            self.assertTrue(kx2.id > 0)
-            self.force_integrity_error()
-            txn.rollback(False)
-
-        self.assertEqual(KX.select().count(), 1)
-        kx1_db = KX.get(KX.key == 'k1')
-        self.assertEqual(kx1_db.value, 1)
-
-    def test_atomic_block_exception(self):
-        with self.assertRaises(IntegrityError):
-            with self.database.atomic():
-                KX.create(key='k2', value=2)
-                KX.create(key='k1', value=10)
-
-        self.assertEqual(KX.select().count(), 1)
+        self.assertEqual(len(accum), 25)
+        self.assertEqual(accum, list(range(25)))
 
 
-class TestPostgresIsolationLevel(DatabaseTestCase):
-    database = db_loader('postgres', isolation_level=3)  # SERIALIZABLE.
-
-    def test_isolation_level(self):
-        conn = self.database.connection()
-        self.assertEqual(conn.isolation_level, 3)
-
-        conn.set_isolation_level(2)
-        self.assertEqual(conn.isolation_level, 2)
-
-        self.database.close()
-        conn = self.database.connection()
-        self.assertEqual(conn.isolation_level, 3)
-
-
-@skip_unless(pg12(), 'cte materialization requires pg >= 12')
-class TestPostgresCTEMaterialization(ModelTestCase):
-    database = db
+class TestServerSideCursorsOption(ModelTestCase):
+    database = db_loader('postgres', db_class=PostgresqlExtDatabase,
+                         server_side_cursors=True)
     requires = [Register]
 
-    def test_postgres_cte_materialization(self):
-        Register.insert_many([(i,) for i in (1, 2, 3)]).execute()
-
-        for materialized in (None, False, True):
-            cte = Register.select().cte('t', materialized=materialized)
-            query = (cte
-                     .select_from(cte.c.value)
-                     .where(cte.c.value != 2)
-                     .order_by(cte.c.value))
-            self.assertEqual([r.value for r in query], [1, 3])
-
-
-@skip_unless(pg93(), 'lateral join requires pg >= 9.3')
-class TestPostgresLateralJoin(ModelTestCase):
-    database = db
-    test_data = (
-        ('a', (('a1', 1),
-               ('a2', 2),
-               ('a10', 10))),
-        ('b', (('b3', 3),
-               ('b4', 4),
-               ('b7', 7))),
-        ('c', ()))
-    ts = functools.partial(datetime.datetime, 2019, 1)
-
-    def create_data(self):
+    def test_server_side_cursors(self):
+        cte = Register.select(Register.id).cte('ids')
+        with_cte = (Register
+                    .select()
+                    .join(cte, on=(Register.id == cte.c.id))
+                    .with_cte(cte))
         with self.database.atomic():
-            for username, tweets in self.test_data:
-                user = User.create(username=username)
-                for c, d in tweets:
-                    Tweet.create(user=user, content=c, timestamp=self.ts(d))
+            for query in (Register.select(),
+                          with_cte,
+                          Register.select() | Register.select()):
+                curs = self.database.execute(query)
+                self.assertTrue(isinstance(curs, FetchManyCursor))
+                curs.close()
 
-    @requires_models(User, Tweet)
-    def test_lateral_top_n(self):
-        self.create_data()
 
-        subq = (Tweet
-                .select(Tweet.content, Tweet.timestamp)
-                .where(Tweet.user == User.id)
-                .order_by(Tweet.timestamp.desc())
-                .limit(2))
-        query = (User
-                 .select(User, subq.c.content)
-                 .join(subq, JOIN.LEFT_LATERAL)
-                 .order_by(subq.c.timestamp.desc(nulls='last')))
-        results = [(u.username, u.content) for u in query]
-        self.assertEqual(results, [
-            ('a', 'a10'),
-            ('b', 'b7'),
-            ('b', 'b4'),
-            ('a', 'a2'),
-            ('c', None)])
+class JDoc(TestModel):
+    data = JSONField()
 
-        query = (Tweet
-                 .select(User.username, subq.c.content)
-                 .from_(User)
-                 .join(subq, JOIN.LEFT_LATERAL)
-                 .order_by(User.username, subq.c.timestamp))
+class JBDoc(TestModel):
+    data = BinaryJSONField()
 
-        results = [(t.username, t.content) for t in query]
-        self.assertEqual(results, [
-            ('a', 'a2'),
-            ('a', 'a10'),
-            ('b', 'b4'),
-            ('b', 'b7'),
-            ('c', None)])
 
-    @requires_models(User, Tweet)
-    def test_lateral_helper(self):
-        self.create_data()
+class TestJsonColumnTypes(ModelTestCase):
+    database = db_loader('postgres')
+    requires = [JDoc, JBDoc]
 
-        subq = (Tweet
-                .select(Tweet.content, Tweet.timestamp)
-                .where(Tweet.user == User.id)
-                .order_by(Tweet.timestamp.desc())
-                .limit(2)
-                .lateral())
+    def test_json_column_types(self):
+        jdoc, jbdoc = JDoc._meta.table_name, JBDoc._meta.table_name
+        curs = self.database.execute_sql(
+            'select table_name, data_type from information_schema.columns '
+            'where column_name = %s and table_name in (%s, %s)',
+            ('data', jdoc, jbdoc))
+        self.assertEqual(dict(curs.fetchall()),
+                         {jdoc: 'json', jbdoc: 'jsonb'})
 
-        query = (User
-                 .select(User, subq.c.content)
-                 .join(subq, on=True)
-                 .order_by(subq.c.timestamp.desc(nulls='last')))
-        with self.assertQueryCount(1):
-            results = [(u.username, u.tweet.content) for u in query]
-            self.assertEqual(results, [
-                ('a', 'a10'),
-                ('b', 'b7'),
-                ('b', 'b4'),
-                ('a', 'a2')])
+    def test_json_function_flavors(self):
+        JDoc.create(data=[1, 2, 3])
+        JBDoc.create(data=[1, 2, 3])
+        self.assertEqual(JDoc.select(JDoc.data.length()).scalar(), 3)
+        self.assertEqual(JBDoc.select(JBDoc.data.length()).scalar(), 3)
+
+    def test_json_lookup_flavor(self):
+        JDoc.create(data={'items': [1, 2]})
+        self.assertEqual(
+            JDoc.select(JDoc.data['items'].length()).scalar(), 2)
+        JBDoc.create(data={'items': [1, 2, 3]})
+        self.assertEqual(
+            JBDoc.select(JBDoc.data['items'].length()).scalar(), 3)

@@ -2,7 +2,6 @@ from peewee import IntegerField
 from playhouse.kv import KeyValue
 
 from .base import DatabaseTestCase
-from .base import db
 
 
 class TestKeyValue(DatabaseTestCase):
@@ -33,6 +32,7 @@ class TestKeyValue(DatabaseTestCase):
         self.assertFalse((KV.key > 'k2') in KV)
 
         del KV['k1']
+        self.assertRaises(KeyError, KV.__delitem__, 'k1')
         KV['k3'] = 'v3'
 
         self.assertFalse('k1' in KV)
@@ -101,6 +101,7 @@ class TestKeyValue(DatabaseTestCase):
         self.assertEqual(KV[KV.key == 'kx'], [])
 
         del KV[KV.key > 'k3']
+        del KV[KV.key > 'zzz']  # Expression matching nothing stays silent.
         self.assertEqual(dict(KV), {
             'k1': 1,
             'k2': 2,

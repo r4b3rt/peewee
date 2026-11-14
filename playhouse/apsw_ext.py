@@ -18,19 +18,49 @@ Here are just a few reasons to use APSW, taken from the documentation:
 """
 import apsw
 from peewee import *
+from peewee import EXCEPTIONS
 from peewee import __exception_wrapper__
 from peewee import BooleanField as _BooleanField
 from peewee import DateField as _DateField
 from peewee import DateTimeField as _DateTimeField
 from peewee import DecimalField as _DecimalField
-from peewee import Insert
 from peewee import TimeField as _TimeField
-from peewee import logger
-
-from playhouse.sqlite_ext import SqliteExtDatabase
 
 
-class APSWDatabase(SqliteExtDatabase):
+# apsw raises one exception per sqlite result code. Map them the way the
+# sqlite3 module does, so callers can catch peewee's DB-API exceptions.
+EXCEPTIONS.update({
+    'SQLError': OperationalError,
+    'BusyError': OperationalError,
+    'LockedError': OperationalError,
+    'ReadOnlyError': OperationalError,
+    'IOError': OperationalError,
+    'FullError': OperationalError,
+    'CantOpenError': OperationalError,
+    'SchemaChangeError': OperationalError,
+    'InterruptError': OperationalError,
+    'AbortError': OperationalError,
+    'PermissionsError': OperationalError,
+    'ProtocolError': OperationalError,
+    'EmptyError': OperationalError,
+    'ExtensionLoadingError': OperationalError,
+    'CorruptError': DatabaseError,
+    'NotADBError': DatabaseError,
+    'AuthError': DatabaseError,
+    'FormatError': DatabaseError,
+    'TooBigError': DataError,
+    'MismatchError': IntegrityError,
+    'MisuseError': InterfaceError,
+    'RangeError': InterfaceError,
+    'NotFoundError': InternalError,
+    'BindingsError': ProgrammingError,
+    'ConnectionClosedError': ProgrammingError,
+    'CursorClosedError': ProgrammingError,
+    'ThreadingViolationError': ProgrammingError,
+})
+
+
+class APSWDatabase(SqliteDatabase):
     server_version = tuple(int(i) for i in apsw.sqlitelibversion().split('.'))
 
     def __init__(self, database, **kwargs):
@@ -48,7 +78,7 @@ class APSWDatabase(SqliteExtDatabase):
     def _connect(self):
         conn = apsw.Connection(self.database, **self.connect_params)
         if self._timeout is not None:
-            conn.setbusytimeout(self._timeout * 1000)
+            conn.setbusytimeout(int(self._timeout * 1000))
         try:
             self._add_conn_hooks(conn)
         except:
@@ -67,7 +97,7 @@ class APSWDatabase(SqliteExtDatabase):
 
     def _load_aggregates(self, conn):
         for name, (klass, num_params) in self._aggregates.items():
-            def make_aggregate():
+            def make_aggregate(klass=klass):
                 return (klass(), klass.step, klass.finalize)
             conn.createaggregatefunction(name, make_aggregate)
 
@@ -76,8 +106,16 @@ class APSWDatabase(SqliteExtDatabase):
             conn.createcollation(name, fn)
 
     def _load_functions(self, conn):
-        for name, (fn, num_params) in self._functions.items():
-            conn.createscalarfunction(name, fn, num_params)
+        for name, (fn, num_params, deterministic) in self._functions.items():
+            args = (deterministic,) if deterministic else ()
+            conn.createscalarfunction(name, fn, num_params, *args)
+
+    def _load_window_functions(self, conn):
+        for name, (klass, num_params) in self._window_functions.items():
+            def make_window(klass=klass):
+                return (klass(), klass.step, klass.finalize, klass.value,
+                        klass.inverse)
+            conn.create_window_function(name, make_window, num_params)
 
     def _load_extensions(self, conn):
         conn.enableloadextension(True)
@@ -91,47 +129,36 @@ class APSWDatabase(SqliteExtDatabase):
             conn.enableloadextension(True)
             conn.loadextension(extension)
 
-    def last_insert_id(self, cursor, query_type=None):
-        if not self.returning_clause:
-            return cursor.getconnection().last_insert_rowid()
-        elif query_type == Insert.SIMPLE:
-            try:
-                return cursor[0][0]
-            except (AttributeError, IndexError, TypeError):
-                pass
-        return cursor
+    def _last_insert_rowid(self, cursor):
+        return cursor.connection.last_insert_rowid()
 
     def rows_affected(self, cursor):
         try:
-            return cursor.getconnection().changes()
+            return cursor.connection.changes()
         except AttributeError:
-            return cursor.cursor.getconnection().changes()  # RETURNING query.
-
-    def begin(self, lock_type='deferred'):
-        self.cursor().execute('begin %s;' % lock_type)
+            return cursor.cursor.connection.changes()  # RETURNING query.
 
     def commit(self):
+        if self.is_closed():
+            raise InterfaceError('Cannot commit, database connection not '
+                                 'open.')
         with __exception_wrapper__:
             curs = self.cursor()
-            if curs.getconnection().getautocommit():
+            if curs.connection.getautocommit():
                 return False
             curs.execute('commit;')
         return True
 
     def rollback(self):
+        if self.is_closed():
+            raise InterfaceError('Cannot rollback, database connection not '
+                                 'open.')
         with __exception_wrapper__:
             curs = self.cursor()
-            if curs.getconnection().getautocommit():
+            if curs.connection.getautocommit():
                 return False
             curs.execute('rollback;')
         return True
-
-    def execute_sql(self, sql, params=None, commit=True):
-        logger.debug((sql, params))
-        with __exception_wrapper__:
-            cursor = self.cursor()
-            cursor.execute(sql, params or ())
-        return cursor
 
 
 def nh(s, v):
